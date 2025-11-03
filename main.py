@@ -8,6 +8,7 @@ HYBRID TRADING BOT v23.0 - COMPLETE PROFESSIONAL
 ✅ News Integration (Finnhub)
 ✅ Redis OI Comparison (3-day expiry)
 ✅ Startup Status + Alert Format
+✅ FIXED HOLIDAYS (Removed Nov 3 & Nov 5)
 """
 
 import os
@@ -102,10 +103,23 @@ FO_STOCKS = {
 
 ALL_SYMBOLS = {**INDICES, **FO_STOCKS}
 
+# ✅ CORRECTED NSE HOLIDAYS 2025 - Removed Nov 3 & Nov 5
 NSE_HOLIDAYS_2025 = [
-    '2025-01-26', '2025-03-14', '2025-03-31', '2025-04-10', '2025-04-14', '2025-04-18',
-    '2025-05-01', '2025-06-07', '2025-07-07', '2025-08-15', '2025-08-27', '2025-10-02',
-    '2025-10-21', '2025-11-01', '2025-11-03', '2025-11-05', '2025-12-25'
+    '2025-01-26',  # Republic Day
+    '2025-03-14',  # Mahashivratri
+    '2025-03-31',  # Eid-ul-Fitr
+    '2025-04-10',  # Mahavir Jayanti
+    '2025-04-14',  # Dr. Ambedkar Jayanti
+    '2025-04-18',  # Good Friday
+    '2025-05-01',  # Maharashtra Day
+    '2025-06-07',  # Eid-ul-Adha (Bakri Eid)
+    '2025-07-07',  # Muharram
+    '2025-08-15',  # Independence Day
+    '2025-08-27',  # Ganesh Chaturthi
+    '2025-10-02',  # Gandhi Jayanti
+    '2025-10-21',  # Dussehra
+    '2025-11-01',  # Diwali Laxmi Pujan
+    '2025-12-25'   # Christmas
 ]
 
 # ==================== DATA CLASSES ====================
@@ -302,7 +316,6 @@ class NewsFetcher:
 class MultiTimeframeProcessor:
     @staticmethod
     def resample_to_timeframe(df_1m: pd.DataFrame, timeframe: str) -> pd.DataFrame:
-        """Resample 1-min data to different timeframes"""
         df = df_1m.copy()
         df.set_index('timestamp', inplace=True)
         
@@ -318,26 +331,22 @@ class MultiTimeframeProcessor:
     
     @staticmethod
     def get_timeframe_bias(df: pd.DataFrame) -> Tuple[str, int]:
-        """Determine bias and confidence for a timeframe"""
         if len(df) < 20:
             return "NEUTRAL", 50
         
         df_tail = df.tail(20)
         closes = df_tail['close'].values
         
-        # Calculate trend
         sma_20 = closes.mean()
         current_price = closes[-1]
         price_vs_sma = ((current_price - sma_20) / sma_20) * 100
         
-        # Higher highs / Lower lows
         recent_highs = df_tail['high'].tail(10).values
         hh_count = sum(1 for i in range(1, len(recent_highs)) if recent_highs[i] > recent_highs[i-1])
         
         recent_lows = df_tail['low'].tail(10).values
         ll_count = sum(1 for i in range(1, len(recent_lows)) if recent_lows[i] < recent_lows[i-1])
         
-        # Determine bias
         if price_vs_sma > 1 and hh_count >= 6:
             bias = "BULLISH"
             confidence = min(95, 60 + int(price_vs_sma * 5))
@@ -350,12 +359,11 @@ class MultiTimeframeProcessor:
         
         return bias, confidence
 
-# ==================== CHART GENERATOR (ENHANCED) ====================
+# ==================== CHART GENERATOR ====================
 class ChartGenerator:
     @staticmethod
     def create_professional_chart(symbol: str, df: pd.DataFrame, analysis: DeepAnalysis, 
                                  spot_price: float, save_path: str):
-        """Generate professional TradingView-style chart with info box"""
         BG = '#131722'
         GRID = '#1e222d'
         TEXT = '#d1d4dc'
@@ -366,24 +374,20 @@ class ChartGenerator:
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(18, 10), gridspec_kw={'height_ratios': [3, 1]}, facecolor=BG)
         
-        # === PRICE CHART ===
         ax1.set_facecolor(BG)
         df_plot = df.tail(150).reset_index(drop=True)
         
-        # Candlesticks
         for idx, row in df_plot.iterrows():
             color = GREEN if row['close'] > row['open'] else RED
             ax1.add_patch(Rectangle((idx, min(row['open'], row['close'])), 0.6,
                                    abs(row['close'] - row['open']), facecolor=color, edgecolor=color, alpha=0.8))
             ax1.plot([idx+0.3, idx+0.3], [row['low'], row['high']], color=color, linewidth=1, alpha=0.6)
         
-        # Order Blocks
         for ob in analysis.order_blocks:
             ax1.add_patch(Rectangle((ob['start_idx'], ob['low']), ob['end_idx'] - ob['start_idx'],
                                    ob['high'] - ob['low'], facecolor=GREEN if ob['type'] == 'bullish' else RED,
                                    alpha=0.15, edgecolor=GREEN if ob['type'] == 'bullish' else RED, linewidth=1.5))
         
-        # Support/Resistance
         for support in analysis.support_levels:
             ax1.axhline(support, color=GREEN, linestyle='--', linewidth=1.5, alpha=0.7)
             ax1.text(len(df_plot)*0.98, support, f'S:₹{support:.1f}  ', color=GREEN, fontsize=10, 
@@ -394,30 +398,25 @@ class ChartGenerator:
             ax1.text(len(df_plot)*0.98, resistance, f'R:₹{resistance:.1f}  ', color=RED, fontsize=10,
                     ha='right', va='top', bbox=dict(boxstyle='round', facecolor=BG, alpha=0.7))
         
-        # Entry/SL/Targets
         ax1.scatter([len(df_plot)-1], [analysis.entry_price], color=YELLOW, s=300, marker='D', 
                    zorder=5, edgecolors='white', linewidths=2.5)
         ax1.axhline(analysis.stop_loss, color=RED, linewidth=2.5, linestyle=':')
         ax1.axhline(analysis.target_1, color=GREEN, linewidth=2, linestyle=':')
         ax1.axhline(analysis.target_2, color=GREEN, linewidth=2, linestyle=':')
         
-        # Entry annotation
         ax1.text(len(df_plot)*0.97, analysis.entry_price, f'ENTRY: ₹{analysis.entry_price:.2f}  ',
                 color=YELLOW, fontsize=11, fontweight='bold', ha='right', va='center',
                 bbox=dict(boxstyle='round', facecolor=BG, edgecolor=YELLOW, linewidth=2))
         
-        # Pattern annotation
         if analysis.pattern_signal:
             ax1.text(len(df_plot)*0.5, df_plot['high'].max() * 0.995, analysis.pattern_signal.upper(),
                     color=YELLOW, fontsize=12, fontweight='bold', ha='center',
                     bbox=dict(boxstyle='round', facecolor=BG, edgecolor=YELLOW, alpha=0.9))
         
-        # CMP Label (right side)
         ax1.text(len(df_plot)-1, spot_price, f'  CMP: ₹{spot_price:.1f}', fontsize=11, color='white',
                 fontweight='bold', bbox=dict(boxstyle='round', facecolor=BLUE, edgecolor='white', linewidth=2),
                 va='center')
         
-        # INFO BOX (Left side)
         tf_bias = analysis.timeframe_bias
         info_text = f"""{'🔴 PE_BUY' if analysis.opportunity == 'PE_BUY' else '🟢 CE_BUY'} | Conf: {analysis.confidence}%
 Reason: {tf_bias.tf_1h} ({tf_bias.tf_1h_confidence}%) + {tf_bias.tf_15m}
@@ -444,7 +443,6 @@ RR: {analysis.risk_reward}"""
                 bbox=dict(boxstyle='round', facecolor=GRID, alpha=0.95, edgecolor=TEXT, linewidth=1),
                 color=TEXT, family='monospace')
         
-        # Title
         title = f"{symbol} | 15min | Score:{analysis.total_score}/100 | "
         title += f"{tf_bias.tf_1h} ({tf_bias.tf_1h_confidence}%) + {tf_bias.tf_15m}"
         if analysis.pattern_signal:
@@ -455,7 +453,6 @@ RR: {analysis.risk_reward}"""
         ax1.tick_params(colors=TEXT)
         ax1.set_ylabel('Price (₹)', color=TEXT, fontsize=11)
         
-        # === VOLUME CHART ===
         ax2.set_facecolor(BG)
         colors = [GREEN if df_plot.iloc[i]['close'] > df_plot.iloc[i]['open'] else RED for i in range(len(df_plot))]
         ax2.bar(range(len(df_plot)), df_plot['volume'], color=colors, alpha=0.6, width=0.8)
@@ -468,7 +465,7 @@ RR: {analysis.risk_reward}"""
         plt.close()
         logger.info(f"  📊 Chart saved: {save_path}")
 
-# ==================== AI ANALYZER (MULTI-TIMEFRAME) ====================
+# ==================== AI ANALYZER ====================
 class AIAnalyzer:
     @staticmethod
     def extract_json(content: str) -> Optional[Dict]:
@@ -507,12 +504,10 @@ class AIAnalyzer:
                      prev_oi: Optional[OIData], news_data: Optional[NewsData],
                      tf_bias: TimeframeBias) -> Optional[DeepAnalysis]:
         try:
-            # Prepare data
             candle_df = mtf_data.df_15m.tail(150).reset_index()
             candle_df['timestamp'] = candle_df['timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%S')
             candles_json = candle_df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].to_json(orient='records')
             
-            # OI section
             oi_section = f"""
 **OI ANALYSIS (Score: 0-50)**
 - PCR: {current_oi.pcr:.2f}
@@ -534,12 +529,10 @@ class AIAnalyzer:
                         pe_str = f"+{pe_change:,}" if pe_change > 0 else f"{pe_change:,}"
                         oi_section += f"| {strike_data.strike} | {ce_str} | {pe_str} |\n"
             
-            # News section
             news_text = ""
             if news_data:
                 news_text = f"\n**NEWS (Context only, not scored):**\n- {news_data.headline}\n- Sentiment: {news_data.sentiment}\n"
             
-            # Multi-timeframe context
             mtf_context = f"""
 **MULTI-TIMEFRAME ANALYSIS:**
 - 1H Bias: {tf_bias.tf_1h} (Confidence: {tf_bias.tf_1h_confidence}%)
@@ -548,7 +541,6 @@ class AIAnalyzer:
 - Alignment: {tf_bias.alignment}
 """
             
-            # AI Prompt
             prompt = f"""You are an institutional F&O trader. Analyze {symbol} using Multi-Timeframe + OI hybrid model.
 
 **DATA INPUT:**
@@ -618,7 +610,6 @@ class AIAnalyzer:
 }}
 ```"""
             
-            # Call AI
             response = requests.post(
                 "https://api.deepseek.com/v1/chat/completions",
                 json={
@@ -646,7 +637,6 @@ class AIAnalyzer:
             
             logger.info(f"  🧠 AI: {analysis_dict.get('opportunity')} | Chart: {analysis_dict.get('chart_score')}/50 | OI: {analysis_dict.get('oi_score')}/50 | Total: {analysis_dict.get('total_score')}/100")
             
-            # Validate
             opportunity = analysis_dict.get('opportunity', 'WAIT')
             if opportunity != "WAIT":
                 if not AIAnalyzer.validate_targets(
@@ -658,12 +648,10 @@ class AIAnalyzer:
                 ):
                     return None
             
-            # Add additional data
             analysis_dict['pcr_value'] = current_oi.pcr
             analysis_dict['timeframe_bias'] = tf_bias
             analysis_dict['news_headline'] = news_data.headline if news_data else None
             
-            # OI Sentiment
             if current_oi.pcr > 1.2:
                 oi_sentiment = "BULLISH"
             elif current_oi.pcr < 0.8:
@@ -761,7 +749,6 @@ class HybridBot:
         self.processed_signals = set()
     
     async def send_startup_message(self):
-        """Send bot startup status"""
         message = f"""
 🚀 **HYBRID BOT v23.0 STARTED**
 
@@ -789,13 +776,10 @@ class HybridBot:
         logger.info("✅ Startup message sent")
     
     async def send_telegram_alert(self, symbol: str, analysis: DeepAnalysis, chart_path: str):
-        """Send chart + text alert"""
         try:
-            # 1. Send Chart
             with open(chart_path, 'rb') as photo:
                 await self.telegram_bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=photo)
             
-            # 2. Send Text
             tf = analysis.timeframe_bias
             message = f"""
 🚨 **{symbol} {analysis.opportunity} SIGNAL**
@@ -842,7 +826,6 @@ Risk:Reward → {analysis.risk_reward}
             logger.error(f"Telegram error: {e}")
     
     async def analyze_symbol(self, instrument_key: str, symbol_info: Dict):
-        """Main analysis pipeline"""
         try:
             symbol_name = symbol_info['name']
             display_name = symbol_info['display_name']
@@ -851,29 +834,24 @@ Risk:Reward → {analysis.risk_reward}
             logger.info(f"🔍 {display_name} ({symbol_name})")
             logger.info(f"{'='*70}")
             
-            # 1. Expiry
             expiry = ExpiryCalculator.get_monthly_expiry(symbol_name)
             logger.info(f"  📅 Expiry: {expiry}")
             
-            # 2. Fetch 1-min data (10 days for resampling)
             df_1m = self.data_fetcher.get_historical_data(instrument_key, "1minute", days=10)
             if df_1m.empty:
                 logger.warning(f"  ⚠️ No data")
                 return
             
-            # 3. Resample to multiple timeframes
             df_1h = MultiTimeframeProcessor.resample_to_timeframe(df_1m, '1H')
             df_15m = MultiTimeframeProcessor.resample_to_timeframe(df_1m, '15T')
             df_5m = MultiTimeframeProcessor.resample_to_timeframe(df_1m, '5T')
             
             logger.info(f"  📊 Data: 1H({len(df_1h)}) | 15M({len(df_15m)}) | 5M({len(df_5m)})")
             
-            # 4. Get timeframe biases
             bias_1h, conf_1h = MultiTimeframeProcessor.get_timeframe_bias(df_1h)
             bias_15m, conf_15m = MultiTimeframeProcessor.get_timeframe_bias(df_15m)
             bias_5m, conf_5m = MultiTimeframeProcessor.get_timeframe_bias(df_5m)
             
-            # Alignment
             if bias_1h == bias_15m == bias_5m:
                 alignment = "STRONG"
             elif bias_1h == bias_15m or bias_15m == bias_5m:
@@ -889,7 +867,6 @@ Risk:Reward → {analysis.risk_reward}
             
             logger.info(f"  📊 TF: 1H {bias_1h}({conf_1h}%) | 15M {bias_15m}({conf_15m}%) | 5M {bias_5m} | {alignment}")
             
-            # 5. ATR & Spot
             df_15m['tr'] = df_15m[['high', 'low', 'close']].apply(
                 lambda x: max(x['high']-x['low'], abs(x['high']-x['close']), abs(x['low']-x['close'])), axis=1
             )
@@ -900,7 +877,6 @@ Risk:Reward → {analysis.risk_reward}
             
             logger.info(f"  💹 Spot: ₹{spot_price:.2f} | ATR: {atr:.2f}")
             
-            # 6. Option Chain
             all_strikes = self.data_fetcher.get_option_chain(instrument_key, expiry)
             if not all_strikes:
                 logger.warning(f"  ⚠️ No OI data")
@@ -909,7 +885,6 @@ Risk:Reward → {analysis.risk_reward}
             top_15 = StrikeSelector.get_top_15_atm_strikes(all_strikes, spot_price)
             logger.info(f"  📊 Selected {len(top_15)} strikes")
             
-            # 7. OI Analysis
             total_ce = sum(s.ce_oi for s in top_15)
             total_pe = sum(s.pe_oi for s in top_15)
             pcr = total_pe / total_ce if total_ce > 0 else 0
@@ -917,10 +892,8 @@ Risk:Reward → {analysis.risk_reward}
             max_ce_strike = max(top_15, key=lambda x: x.ce_oi).strike
             max_pe_strike = max(top_15, key=lambda x: x.pe_oi).strike
             
-            # Get previous OI for comparison
             prev_oi = RedisOIManager.get_comparison_oi(symbol_name, expiry, datetime.now(IST))
             
-            # Calculate OI change %
             ce_change_pct = 0.0
             pe_change_pct = 0.0
             if prev_oi:
@@ -939,15 +912,12 @@ Risk:Reward → {analysis.risk_reward}
             
             logger.info(f"  📊 PCR: {pcr:.2f} | S: {max_pe_strike} | R: {max_ce_strike} | CE: {ce_change_pct:+.1f}% | PE: {pe_change_pct:+.1f}%")
             
-            # 8. Save OI
             RedisOIManager.save_oi(symbol_name, expiry, current_oi)
             
-            # 9. News
             news_data = NewsFetcher.fetch_finnhub_news(symbol_name)
             if news_data:
                 logger.info(f"  📰 {news_data.headline[:60]}...")
             
-            # 10. AI Analysis
             mtf_data = MultiTimeframeData(df_1h=df_1h, df_15m=df_15m, df_5m=df_5m, spot_price=spot_price, atr=atr)
             analysis = AIAnalyzer.deep_analysis(symbol_name, mtf_data, current_oi, prev_oi, news_data, tf_bias)
             
@@ -955,18 +925,15 @@ Risk:Reward → {analysis.risk_reward}
                 logger.info(f"  ⏸️ No valid analysis")
                 return
             
-            # 11. Check threshold
             if analysis.total_score >= 75 and analysis.confidence >= 75:
                 signal_key = f"{symbol_name}_{analysis.opportunity}_{datetime.now(IST).strftime('%Y%m%d_%H')}"
                 
                 if signal_key not in self.processed_signals:
                     logger.info(f"  🚨 ALERT! Score: {analysis.total_score} | Conf: {analysis.confidence}%")
                     
-                    # Generate chart
                     chart_path = f"/tmp/{symbol_name}_chart.png"
                     ChartGenerator.create_professional_chart(display_name, df_15m, analysis, spot_price, chart_path)
                     
-                    # Send alert
                     await self.send_telegram_alert(display_name, analysis, chart_path)
                     self.processed_signals.add(signal_key)
                 else:
@@ -979,7 +946,6 @@ Risk:Reward → {analysis.risk_reward}
             traceback.print_exc()
     
     async def run_scanner(self):
-        """Main loop"""
         logger.info("\n" + "="*80)
         logger.info("🚀 HYBRID BOT v23.0 - MULTI-TIMEFRAME PROFESSIONAL")
         logger.info("="*80)
@@ -991,13 +957,11 @@ Risk:Reward → {analysis.risk_reward}
                 now = datetime.now(IST)
                 current_time = now.time()
                 
-                # Market hours check
                 if current_time < time(9, 15) or current_time > time(15, 30):
                     logger.info(f"⏸️ Market closed. Waiting...")
                     await asyncio.sleep(300)
                     continue
                 
-                # Holiday check
                 if now.strftime('%Y-%m-%d') in NSE_HOLIDAYS_2025 or now.weekday() >= 5:
                     logger.info(f"📅 Holiday. Pausing...")
                     await asyncio.sleep(3600)
@@ -1005,7 +969,6 @@ Risk:Reward → {analysis.risk_reward}
                 
                 logger.info(f"\n🔄 Scan started: {now.strftime('%H:%M:%S')}")
                 
-                # Scan all symbols
                 for instrument_key, symbol_info in ALL_SYMBOLS.items():
                     await self.analyze_symbol(instrument_key, symbol_info)
                     await asyncio.sleep(2)
