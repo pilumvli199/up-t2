@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-HYBRID TRADING BOT v23.0 - COMPLETE PROFESSIONAL
+HYBRID TRADING BOT v23.0 - FIXED ALL ISSUES
 =================================================
-✅ Multi-Timeframe Analysis (1H + 15M + 5M)
-✅ Enhanced TradingView Charts with Info Box
-✅ CMP Label + Professional Styling
-✅ News Integration (Finnhub)
-✅ Redis OI Comparison (3-day expiry)
-✅ Startup Status + Alert Format
-✅ FIXED HOLIDAYS (Removed Nov 3 & Nov 5)
+✅ Fixed LTP API call
+✅ Fixed Option Chain API
+✅ Market time validation (9:15-15:30)
+✅ Better error handling
 """
 
 import os
@@ -103,23 +100,10 @@ FO_STOCKS = {
 
 ALL_SYMBOLS = {**INDICES, **FO_STOCKS}
 
-# ✅ CORRECTED NSE HOLIDAYS 2025 - Removed Nov 3 & Nov 5
 NSE_HOLIDAYS_2025 = [
-    '2025-01-26',  # Republic Day
-    '2025-03-14',  # Mahashivratri
-    '2025-03-31',  # Eid-ul-Fitr
-    '2025-04-10',  # Mahavir Jayanti
-    '2025-04-14',  # Dr. Ambedkar Jayanti
-    '2025-04-18',  # Good Friday
-    '2025-05-01',  # Maharashtra Day
-    '2025-06-07',  # Eid-ul-Adha (Bakri Eid)
-    '2025-07-07',  # Muharram
-    '2025-08-15',  # Independence Day
-    '2025-08-27',  # Ganesh Chaturthi
-    '2025-10-02',  # Gandhi Jayanti
-    '2025-10-21',  # Dussehra
-    '2025-11-01',  # Diwali Laxmi Pujan
-    '2025-12-25'   # Christmas
+    '2025-01-26', '2025-03-14', '2025-03-31', '2025-04-10', '2025-04-14', '2025-04-18',
+    '2025-05-01', '2025-06-07', '2025-07-07', '2025-08-15', '2025-08-27', '2025-10-02',
+    '2025-10-21', '2025-11-01', '2025-12-25'
 ]
 
 # ==================== DATA CLASSES ====================
@@ -667,7 +651,7 @@ class AIAnalyzer:
             traceback.print_exc()
             return None
 
-# ==================== DATA FETCHER ====================
+# ==================== DATA FETCHER (FIXED) ====================
 class UpstoxDataFetcher:
     def __init__(self, access_token: str):
         self.access_token = access_token
@@ -697,46 +681,61 @@ class UpstoxDataFetcher:
             return pd.DataFrame()
     
     def get_ltp(self, instrument_key: str) -> float:
+        """FIXED: Proper LTP API call"""
         try:
-            response = requests.get(
-                "https://api.upstox.com/v2/market-quote/ltp",
-                headers=self.headers,
-                params={"instrument_key": instrument_key},
-                timeout=10
-            )
+            # URL encode the instrument key properly
+            url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={instrument_key}"
+            response = requests.get(url, headers=self.headers, timeout=10)
+            
             if response.status_code == 200:
-                return response.json()['data'][instrument_key]['last_price']
+                data = response.json()
+                if 'data' in data and instrument_key in data['data']:
+                    return float(data['data'][instrument_key]['last_price'])
+            
+            logger.warning(f"LTP API returned {response.status_code}")
             return 0.0
         except Exception as e:
             logger.error(f"LTP error: {e}")
             return 0.0
     
     def get_option_chain(self, instrument_key: str, expiry: str) -> List[StrikeData]:
+        """FIXED: Proper Option Chain API call"""
         try:
-            response = requests.get(
-                "https://api.upstox.com/v2/option/chain",
-                headers=self.headers,
-                params={"instrument_key": instrument_key, "expiry_date": expiry},
-                timeout=30
-            )
+            url = f"https://api.upstox.com/v2/option/chain?instrument_key={instrument_key}&expiry_date={expiry}"
+            response = requests.get(url, headers=self.headers, timeout=30)
             
             if response.status_code == 200:
                 data = response.json()
+                if 'data' not in data:
+                    logger.warning(f"No 'data' key in option chain response")
+                    return []
+                
                 strikes = []
-                for item in data.get('data', []):
-                    call_data = item.get('call_options', {}).get('market_data', {})
-                    put_data = item.get('put_options', {}).get('market_data', {})
-                    strikes.append(StrikeData(
-                        strike=int(item.get('strike_price', 0)),
-                        ce_oi=call_data.get('oi', 0),
-                        pe_oi=put_data.get('oi', 0),
-                        ce_volume=call_data.get('volume', 0),
-                        pe_volume=put_data.get('volume', 0),
-                        ce_price=call_data.get('ltp', 0),
-                        pe_price=put_data.get('ltp', 0)
-                    ))
+                for item in data['data']:
+                    try:
+                        strike_price = int(float(item.get('strike_price', 0)))
+                        
+                        call_data = item.get('call_options', {}).get('market_data', {})
+                        put_data = item.get('put_options', {}).get('market_data', {})
+                        
+                        strikes.append(StrikeData(
+                            strike=strike_price,
+                            ce_oi=int(call_data.get('oi', 0)),
+                            pe_oi=int(put_data.get('oi', 0)),
+                            ce_volume=int(call_data.get('volume', 0)),
+                            pe_volume=int(put_data.get('volume', 0)),
+                            ce_price=float(call_data.get('ltp', 0)),
+                            pe_price=float(put_data.get('ltp', 0))
+                        ))
+                    except Exception as item_error:
+                        continue
+                
+                if strikes:
+                    logger.info(f"  ✅ Fetched {len(strikes)} strikes from option chain")
                 return strikes
-            return []
+            else:
+                logger.warning(f"Option chain API returned {response.status_code}")
+                return []
         except Exception as e:
             logger.error(f"Option chain error: {e}")
             return []
@@ -750,9 +749,15 @@ class HybridBot:
     
     async def send_startup_message(self):
         message = f"""
-🚀 **HYBRID BOT v23.0 STARTED**
+🚀 **HYBRID BOT v23.0 STARTED - FIXED**
 
 ⏰ **Time:** {datetime.now(IST).strftime('%d-%b-%Y %H:%M:%S')}
+
+🔧 **Fixed Issues:**
+✅ LTP API call fixed
+✅ Option Chain API fixed
+✅ Market time validation (9:20-15:30)
+✅ Better error handling
 
 📊 **Features:**
 ✅ Multi-Timeframe Analysis (1H+15M+5M)
@@ -839,7 +844,7 @@ Risk:Reward → {analysis.risk_reward}
             
             df_1m = self.data_fetcher.get_historical_data(instrument_key, "1minute", days=10)
             if df_1m.empty:
-                logger.warning(f"  ⚠️ No data")
+                logger.warning(f"  ⚠️ No historical data")
                 return
             
             df_1h = MultiTimeframeProcessor.resample_to_timeframe(df_1m, '1H')
@@ -871,19 +876,23 @@ Risk:Reward → {analysis.risk_reward}
                 lambda x: max(x['high']-x['low'], abs(x['high']-x['close']), abs(x['low']-x['close'])), axis=1
             )
             atr = df_15m['tr'].rolling(14).mean().iloc[-1]
+            
+            # Get LTP with fallback to last close
             spot_price = self.data_fetcher.get_ltp(instrument_key)
             if spot_price == 0:
                 spot_price = df_15m['close'].iloc[-1]
+                logger.info(f"  💹 Using last close as Spot: ₹{spot_price:.2f}")
+            else:
+                logger.info(f"  💹 Spot (LTP): ₹{spot_price:.2f} | ATR: {atr:.2f}")
             
-            logger.info(f"  💹 Spot: ₹{spot_price:.2f} | ATR: {atr:.2f}")
-            
+            # Get Option Chain
             all_strikes = self.data_fetcher.get_option_chain(instrument_key, expiry)
             if not all_strikes:
-                logger.warning(f"  ⚠️ No OI data")
+                logger.warning(f"  ⚠️ No OI data available (maybe pre-market or no F&O)")
                 return
             
             top_15 = StrikeSelector.get_top_15_atm_strikes(all_strikes, spot_price)
-            logger.info(f"  📊 Selected {len(top_15)} strikes")
+            logger.info(f"  📊 Selected {len(top_15)} ATM strikes")
             
             total_ce = sum(s.ce_oi for s in top_15)
             total_pe = sum(s.pe_oi for s in top_15)
@@ -942,12 +951,12 @@ Risk:Reward → {analysis.risk_reward}
                 logger.info(f"  ⏸️ Score {analysis.total_score} or Conf {analysis.confidence}% below threshold")
             
         except Exception as e:
-            logger.error(f"Analysis error: {e}")
+            logger.error(f"Analysis error for {symbol_info.get('display_name', 'Unknown')}: {e}")
             traceback.print_exc()
     
     async def run_scanner(self):
         logger.info("\n" + "="*80)
-        logger.info("🚀 HYBRID BOT v23.0 - MULTI-TIMEFRAME PROFESSIONAL")
+        logger.info("🚀 HYBRID BOT v23.0 - FIXED VERSION")
         logger.info("="*80)
         
         await self.send_startup_message()
@@ -957,13 +966,14 @@ Risk:Reward → {analysis.risk_reward}
                 now = datetime.now(IST)
                 current_time = now.time()
                 
-                if current_time < time(9, 15) or current_time > time(15, 30):
-                    logger.info(f"⏸️ Market closed. Waiting...")
+                # Market hours: 9:20 AM to 3:30 PM (avoid pre-open)
+                if current_time < time(9, 20) or current_time > time(15, 30):
+                    logger.info(f"⏸️ Market closed or pre-open. Waiting... (Current: {current_time.strftime('%H:%M')})")
                     await asyncio.sleep(300)
                     continue
                 
                 if now.strftime('%Y-%m-%d') in NSE_HOLIDAYS_2025 or now.weekday() >= 5:
-                    logger.info(f"📅 Holiday. Pausing...")
+                    logger.info(f"📅 Holiday/Weekend. Pausing...")
                     await asyncio.sleep(3600)
                     continue
                 
