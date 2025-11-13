@@ -461,29 +461,32 @@ class UpstoxDataFetcher:
     def get_combined_candles(self) -> pd.DataFrame:
         """Get combined historical + intraday candles for 420 candle analysis"""
         try:
-            # Step 1: Get historical data (past days)
+            # Step 1: Get historical data (V3 API - 5 min)
+            logger.info("  📥 Fetching historical 5-min data (V3 API)...")
             df_historical = self.get_historical_data(days=10)
             
-            # Step 2: Get today's intraday data
+            # Step 2: Get today's intraday data (1-min converted to 5-min)
+            logger.info("  📥 Fetching intraday 1-min → 5-min data...")
             df_intraday = self.get_intraday_data()
             
             # Step 3: Combine both
             if not df_historical.empty and not df_intraday.empty:
                 df_combined = pd.concat([df_historical, df_intraday]).drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
-                logger.info(f"  ✅ Combined: {len(df_historical)} historical + {len(df_intraday)} intraday = {len(df_combined)} total candles")
+                logger.info(f"  ✅ Combined: {len(df_historical)} hist + {len(df_intraday)} intraday = {len(df_combined)} total")
                 return df_combined
             elif not df_historical.empty:
-                logger.warning(f"  ⚠️ No intraday data, using only historical")
+                logger.warning(f"  ⚠️ No intraday data, using only historical ({len(df_historical)} candles)")
                 return df_historical
             elif not df_intraday.empty:
-                logger.warning(f"  ⚠️ No historical data, using only intraday")
+                logger.warning(f"  ⚠️ No historical data, using only intraday ({len(df_intraday)} candles)")
                 return df_intraday
             else:
-                logger.error(f"  ❌ No candle data available!")
+                logger.error(f"  ❌ No candle data available from any source!")
                 return pd.DataFrame()
                 
         except Exception as e:
             logger.error(f"  ❌ Combined candles error: {e}")
+            traceback.print_exc()
             return pd.DataFrame()
     
     def get_ltp(self) -> float:
@@ -1165,8 +1168,21 @@ class SensexBot:
             for s in strikes_to_show:
                 ce_oi_k = f"{s.ce_oi/1000:.0f}K" if s.ce_oi >= 1000 else str(s.ce_oi)
                 pe_oi_k = f"{s.pe_oi/1000:.0f}K" if s.pe_oi >= 1000 else str(s.pe_oi)
-                ce_delta = f"+{s.ce_oi_change/1000:.0f}K" if s.ce_oi_change > 0 else f"{s.ce_oi_change/1000:.0f}K"
-                pe_delta = f"+{s.pe_oi_change/1000:.0f}K" if s.pe_oi_change > 0 else f"{s.pe_oi_change/1000:.0f}K"
+                
+                # Handle delta display
+                if s.ce_oi_change == 0:
+                    ce_delta = "-"
+                elif s.ce_oi_change > 0:
+                    ce_delta = f"+{abs(s.ce_oi_change)/1000:.0f}K"
+                else:
+                    ce_delta = f"-{abs(s.ce_oi_change)/1000:.0f}K"
+                
+                if s.pe_oi_change == 0:
+                    pe_delta = "-"
+                elif s.pe_oi_change > 0:
+                    pe_delta = f"+{abs(s.pe_oi_change)/1000:.0f}K"
+                else:
+                    pe_delta = f"-{abs(s.pe_oi_change)/1000:.0f}K"
                 
                 marker = "→" if s.strike == atm_strike else " "
                 oi_table += f"{marker}{s.strike:5d} | {ce_oi_k:6s} | {ce_delta:6s} | {pe_oi_k:6s} | {pe_delta:6s}\n"
