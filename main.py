@@ -762,45 +762,195 @@ class AIAnalyzer:
         current_price: float,
         current_oi: OISnapshot
     ) -> Optional[TradeSignal]:
-        """Send ultra-compressed analysis request to DeepSeek"""
+        """Send ultra-compressed analysis request to DeepSeek with ELITE PROMPT"""
         
         try:
             # Ultra-compressed formats
             candles_compressed, total_candles = UltraCompressor.compress_candles(df_5m)
             oi_compressed = UltraCompressor.compress_oi(current_oi.strikes)
             
-            # Calculate simple momentum indicators
+            # Calculate indicators
             df_tail = df_5m.tail(50)
             sma_20 = df_tail['close'].tail(20).mean()
             price_momentum = ((current_price - sma_20) / sma_20) * 100
             
-            # Recent candle bias
+            # Recent candle analysis
             recent_closes = df_tail['close'].tail(10).values
             bullish_candles = sum(1 for i in range(1, len(recent_closes)) if recent_closes[i] > recent_closes[i-1])
             
-            # Ultra-compact prompt
-            prompt = f"""SENSEX 5-MIN ANALYSIS
+            # Last 5 candles momentum
+            last_5_candles = df_tail.tail(5)
+            last_5_change = ((last_5_candles['close'].iloc[-1] - last_5_candles['close'].iloc[0]) / last_5_candles['close'].iloc[0]) * 100
+            
+            # Volume surge detection
+            avg_volume = df_tail['volume'].mean()
+            current_volume = df_tail['volume'].iloc[-1]
+            volume_surge = (current_volume / avg_volume) if avg_volume > 0 else 1
+            
+            # Price position vs key levels
+            distance_from_sma = current_price - sma_20
+            
+            # ELITE PROFESSIONAL PROMPT
+            prompt = f"""You are an ELITE intraday options trader with 15+ years experience. Analyze SENSEX 5-min data for precise entry timing.
 
-PRICE: ₹{current_price:.2f} | TIME: {datetime.now(IST).strftime('%H:%M')}
+📊 CURRENT MARKET STATE:
+Price: ₹{current_price:.2f} | Time: {datetime.now(IST).strftime('%H:%M')}
+SMA20: ₹{sma_20:.0f} | Momentum: {price_momentum:+.2f}%
+Last 5 Candles Change: {last_5_change:+.2f}%
+Volume Surge: {volume_surge:.2f}x
+Bullish Candles (Last 10): {bullish_candles}/10
 
-**5-MIN CANDLES (Total: {total_candles}):**
+📈 5-MIN CANDLES (Total: {total_candles}):
 Time |Open |High |Low  |Close|Vol
 {candles_compressed}
 
-**OPTION CHAIN (ATM ±10):**
+📊 OPTION CHAIN DATA (ATM ±10):
 Strike|C_OI|C_Δ|P_OI|P_Δ
 {oi_compressed}
 
-**METRICS:**
+📊 OI METRICS:
 PCR: {current_oi.pcr:.2f} | MaxPain: {current_oi.max_pain}
-Support: {','.join(map(str, current_oi.support_strikes[:2]))}
-Resistance: {','.join(map(str, current_oi.resistance_strikes[:2]))}
-Momentum: {price_momentum:+.1f}% | SMA20: ₹{sma_20:.0f}
-Bullish/10: {bullish_candles}
+Top PE Strikes (Support): {', '.join(map(str, current_oi.support_strikes[:3]))}
+Top CE Strikes (Resistance): {', '.join(map(str, current_oi.resistance_strikes[:3]))}
 
-**TASK:** Analyze 5-min price + OI. Output JSON with signal.
+═══════════════════════════════════════════════════════════
+🎯 CRITICAL ANALYSIS RULES - FOLLOW STRICTLY:
+═══════════════════════════════════════════════════════════
 
-**JSON:**
+📍 OI INTERPRETATION (MOST IMPORTANT):
+✅ CE OI Buildup (C_Δ positive) = CALL WRITERS = BEARISH SIGNAL
+   → Heavy call writing means sellers expect price to fall/stagnate
+   → Example: Strike 85000 has C_Δ +500K = Strong resistance/sellers
+
+✅ PE OI Buildup (P_Δ positive) = PUT WRITERS = BULLISH SIGNAL  
+   → Heavy put writing means buyers expect price to rise
+   → Example: Strike 84500 has P_Δ +400K = Strong support/buyers
+
+✅ CE OI Unwinding (C_Δ negative) = BULLISH (shorts covering)
+✅ PE OI Unwinding (P_Δ negative) = BEARISH (longs exiting)
+
+❌ NEVER say "CE OI buildup indicates bullish bias" - THIS IS WRONG!
+❌ NEVER say "PE OI buildup indicates bearish bias" - THIS IS WRONG!
+
+═══════════════════════════════════════════════════════════
+🚀 CE_BUY SIGNAL CRITERIA (Call Option Buy):
+═══════════════════════════════════════════════════════════
+
+Entry Conditions (ALL must be TRUE):
+1. Price Action:
+   ✅ Fresh breakout from consolidation/support
+   ✅ Price near support level (not resistance!)
+   ✅ Making higher lows OR breaking above resistance
+   ✅ Last 5 candles momentum > +0.3%
+   ✅ Price above SMA20 OR just breaking above
+
+2. OI Signals (Critical):
+   ✅ PE OI buildup at/below current price (P_Δ positive) = Support
+   ✅ CE OI unwinding above (C_Δ negative) = Shorts covering
+   ✅ PCR > 1.1 (more puts = bullish undertone)
+   ✅ Max Pain below current price (pulls price up)
+
+3. Volume & Momentum:
+   ✅ Volume surge > 1.2x average
+   ✅ Bullish candles in last 10 > 6
+   ✅ No immediate resistance within 100 points
+
+4. Timing (Critical):
+   ✅ Early momentum stage (not after 3+ green candles)
+   ✅ NOT near day high/resistance
+   ✅ Fresh setup forming NOW
+
+❌ REJECT CE_BUY if:
+- Price near resistance with heavy CE OI buildup
+- Already rallied 200+ points without pullback
+- CE OI buildup (C_Δ positive) at current/above levels
+- Price stalling at resistance
+- Momentum exhausted (5+ consecutive green candles)
+
+═══════════════════════════════════════════════════════════
+🔻 PE_BUY SIGNAL CRITERIA (Put Option Buy):
+═══════════════════════════════════════════════════════════
+
+Entry Conditions (ALL must be TRUE):
+1. Price Action:
+   ✅ Fresh breakdown from consolidation/resistance
+   ✅ Price near resistance level (not support!)
+   ✅ Making lower highs OR breaking below support
+   ✅ Last 5 candles momentum < -0.3%
+   ✅ Price below SMA20 OR just breaking below
+
+2. OI Signals (Critical):
+   ✅ CE OI buildup at/above current price (C_Δ positive) = Resistance
+   ✅ PE OI unwinding below (P_Δ negative) = Longs exiting
+   ✅ PCR < 1.0 (more calls = bearish undertone)
+   ✅ Max Pain above current price (pulls price down)
+
+3. Volume & Momentum:
+   ✅ Volume surge > 1.2x average
+   ✅ Bearish candles in last 10 > 6
+   ✅ No immediate support within 100 points
+
+4. Timing (Critical):
+   ✅ Early breakdown stage (not after 3+ red candles)
+   ✅ NOT near day low/support
+   ✅ Fresh setup forming NOW
+
+❌ REJECT PE_BUY if:
+- Price near support with heavy PE OI buildup
+- Already fell 200+ points without bounce
+- PE OI buildup (P_Δ positive) at current/below levels
+- Price holding at support
+- Momentum exhausted (5+ consecutive red candles)
+
+═══════════════════════════════════════════════════════════
+⏸️ NO_TRADE CRITERIA:
+═══════════════════════════════════════════════════════════
+
+Issue NO_TRADE when:
+✅ Choppy/sideways price action (no clear trend)
+✅ Mixed OI signals (both CE & PE buildup)
+✅ Price in middle of range (not near support/resistance)
+✅ Low volume (< 0.8x average)
+✅ Momentum exhausted (after big move)
+✅ Conflicting signals between price & OI
+✅ Late entry (momentum already played out)
+
+═══════════════════════════════════════════════════════════
+🎯 STOP LOSS & TARGET CALCULATION:
+═══════════════════════════════════════════════════════════
+
+CE_BUY Setup:
+- Entry: Current price
+- Stop Loss: Below nearest support OR -0.4% from entry
+- Target 1: Nearest resistance OR +0.6% from entry
+- Target 2: Next resistance OR +1.0% from entry
+- Risk:Reward minimum 1:1.5
+
+PE_BUY Setup:
+- Entry: Current price
+- Stop Loss: Above nearest resistance OR +0.4% from entry
+- Target 1: Nearest support OR -0.6% from entry
+- Target 2: Next support OR -1.0% from entry
+- Risk:Reward minimum 1:1.5
+
+═══════════════════════════════════════════════════════════
+📊 CONFIDENCE SCORING (0-100):
+═══════════════════════════════════════════════════════════
+
+85-100: All criteria perfect, fresh momentum starting
+75-84: Strong setup, minor concern (1 condition weak)
+65-74: Moderate setup, some conditions missing
+50-64: Weak setup, conflicting signals
+Below 50: NO_TRADE
+
+Minimum for alert: 75% confidence + 7/10 score
+
+═══════════════════════════════════════════════════════════
+🎯 OUTPUT REQUIREMENTS:
+═══════════════════════════════════════════════════════════
+
+Respond ONLY in JSON format:
+
 {{
   "signal_type": "CE_BUY/PE_BUY/NO_TRADE",
   "confidence": 85,
@@ -810,15 +960,23 @@ Bullish/10: {bullish_candles}
   "target_2": 0.0,
   "risk_reward": "1:2.5",
   "recommended_strike": {round(current_price/100)*100},
-  "reasoning": "Brief (max 120 chars)",
-  "price_analysis": "Summary (max 150 chars)",
-  "oi_analysis": "Summary (max 150 chars)",
+  "reasoning": "Brief reason (max 120 chars) - explain TIMING",
+  "price_analysis": "What price is doing NOW (max 150 chars)",
+  "oi_analysis": "Correct OI interpretation (max 150 chars)",
   "alignment_score": 8,
   "risk_factors": ["Risk1", "Risk2"],
   "support_levels": [0.0, 0.0],
   "resistance_levels": [0.0, 0.0],
-  "pattern_detected": "Pattern or None"
-}}"""
+  "pattern_detected": "Pattern name or None"
+}}
+
+CRITICAL REMINDERS:
+❌ NO late entries after momentum exhausted
+❌ NO buying tops or selling bottoms
+❌ NO wrong OI interpretation (CE buildup ≠ bullish!)
+✅ ONLY fresh momentum starting signals
+✅ PERFECT timing at start of moves
+✅ CORRECT OI logic always"""
             
             response = requests.post(
                 "https://api.deepseek.com/v1/chat/completions",
@@ -827,15 +985,15 @@ Bullish/10: {bullish_candles}
                     "messages": [
                         {
                             "role": "system",
-                            "content": "Elite F&O trader. Analyze 5-min data. Respond ONLY in JSON."
+                            "content": "You are an elite F&O trader. Analyze with precision. Follow ALL rules strictly. Respond ONLY in JSON."
                         },
                         {
                             "role": "user",
                             "content": prompt
                         }
                     ],
-                    "temperature": 0.2,
-                    "max_tokens": 2000
+                    "temperature": 0.15,
+                    "max_tokens": 2500
                 },
                 headers={
                     "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
@@ -1168,21 +1326,8 @@ class SensexBot:
             for s in strikes_to_show:
                 ce_oi_k = f"{s.ce_oi/1000:.0f}K" if s.ce_oi >= 1000 else str(s.ce_oi)
                 pe_oi_k = f"{s.pe_oi/1000:.0f}K" if s.pe_oi >= 1000 else str(s.pe_oi)
-                
-                # Handle delta display
-                if s.ce_oi_change == 0:
-                    ce_delta = "-"
-                elif s.ce_oi_change > 0:
-                    ce_delta = f"+{abs(s.ce_oi_change)/1000:.0f}K"
-                else:
-                    ce_delta = f"-{abs(s.ce_oi_change)/1000:.0f}K"
-                
-                if s.pe_oi_change == 0:
-                    pe_delta = "-"
-                elif s.pe_oi_change > 0:
-                    pe_delta = f"+{abs(s.pe_oi_change)/1000:.0f}K"
-                else:
-                    pe_delta = f"-{abs(s.pe_oi_change)/1000:.0f}K"
+                ce_delta = f"+{s.ce_oi_change/1000:.0f}K" if s.ce_oi_change > 0 else f"{s.ce_oi_change/1000:.0f}K"
+                pe_delta = f"+{s.pe_oi_change/1000:.0f}K" if s.pe_oi_change > 0 else f"{s.pe_oi_change/1000:.0f}K"
                 
                 marker = "→" if s.strike == atm_strike else " "
                 oi_table += f"{marker}{s.strike:5d} | {ce_oi_k:6s} | {ce_delta:6s} | {pe_oi_k:6s} | {pe_delta:6s}\n"
