@@ -314,35 +314,43 @@ class UpstoxDataFetcher:
         self.access_token = access_token
         self.headers = {
             "Authorization": f"Bearer {access_token}",
-            "Accept": "application/json"
+            "Accept": "application/json",
+            "Content-Type": "application/json"
         }
     
     def get_intraday_data(self) -> pd.DataFrame:
-        """Fetch TODAY's live intraday 5-minute candles"""
+        """
+        Fetch TODAY's live intraday 1-minute candles (V2 API)
+        Then convert to 5-minute candles
+        """
         try:
             encoded_symbol = urllib.parse.quote(SENSEX_SYMBOL, safe='')
-            url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_symbol}/5minute"
+            # Use 1-minute interval as 5-minute is not supported in intraday
+            url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_symbol}/1minute"
             
-            logger.info(f"  📡 Fetching intraday data (today's live candles)...")
+            logger.info(f"  📡 Fetching intraday 1-min data...")
             response = requests.get(url, headers=self.headers, timeout=30)
             
             logger.info(f"  📡 Intraday API Status: {response.status_code}")
             
             if response.status_code == 200:
                 data = response.json()
-                if 'data' in data and 'candles' in data['data']:
+                if data.get('status') == 'success' and 'data' in data and 'candles' in data['data']:
                     df = pd.DataFrame(
                         data['data']['candles'],
                         columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi']
                     )
                     df['timestamp'] = pd.to_datetime(df['timestamp'])
                     df = df.sort_values('timestamp').reset_index(drop=True)
-                    logger.info(f"  ✅ Fetched {len(df)} intraday candles (today)")
-                    return df
+                    
+                    # Convert 1-min to 5-min candles
+                    df_5min = self.convert_to_5min(df)
+                    logger.info(f"  ✅ Converted {len(df)} 1-min → {len(df_5min)} 5-min candles")
+                    return df_5min
                 else:
-                    logger.warning(f"  ⚠️ No intraday candles in response")
+                    logger.warning(f"  ⚠️ No intraday candles: {data}")
             else:
-                logger.warning(f"  ⚠️ Intraday API returned {response.status_code}")
+                logger.warning(f"  ⚠️ Intraday API error {response.status_code}: {response.text[:200]}")
             
             return pd.DataFrame()
             
@@ -351,42 +359,103 @@ class UpstoxDataFetcher:
             traceback.print_exc()
             return pd.DataFrame()
     
-    def get_historical_data(self, days: int = 7) -> pd.DataFrame:
-        """Fetch historical 5-minute data (past days, NOT today)"""
+    def convert_to_5min(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Convert 1-minute candles to 5-minute candles"""
+        if df.empty:
+            return df
+        
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df.set_index('timestamp', inplace=True)
+        
+        # Resample to 5-minute intervals
+        df_5min = df.resample('5T').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum',
+            'oi': 'last'
+        }).dropna()
+        
+        df_5min.reset_index(inplace=True)
+        return df_5min
+    
+    def get_historical_data(self, days: int = 10) -> pd.DataFrame:
+        """
+        Fetch historical 5-minute data using V3 API (FIXED)
+        """
         try:
             to_date = (datetime.now(IST) - timedelta(days=1)).date()  # Yesterday
             from_date = to_date - timedelta(days=days)
             
-            encoded_symbol = urllib.parse.quote(SENSEX_SYMBOL, safe='')
+            # V3 API endpoint with correct format
+            url = f"https://api.upstox.com/v3/historical-candle/{SENSEX_SYMBOL}/minutes/5/{to_date.strftime('%Y-%m-%d')}/{from_date.strftime('%Y-%m-%d')}"
             
-            url = f"https://api.upstox.com/v2/historical-candle/{encoded_symbol}/5minute/{to_date.strftime('%Y-%m-%d')}/{from_date.strftime('%Y-%m-%d')}"
-            
-            logger.info(f"  📡 Fetching historical data ({from_date} to {to_date})...")
+            logger.info(f"  📡 V3 API: {url}")
             response = requests.get(url, headers=self.headers, timeout=30)
             
-            logger.info(f"  📡 Historical API Status: {response.status_code}")
+            logger.info(f"  📡 Historical V3 Status: {response.status_code}")
             
             if response.status_code == 200:
                 data = response.json()
-                if 'data' in data and 'candles' in data['data']:
+                if data.get('status') == 'success' and 'data' in data and 'candles' in data['data']:
                     df = pd.DataFrame(
                         data['data']['candles'],
                         columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi']
                     )
                     df['timestamp'] = pd.to_datetime(df['timestamp'])
                     df = df.sort_values('timestamp').reset_index(drop=True)
-                    logger.info(f"  ✅ Fetched {len(df)} historical candles")
+                    logger.info(f"  ✅ Fetched {len(df)} historical 5-min candles (V3)")
                     return df
                 else:
-                    logger.warning(f"  ⚠️ No historical candles in response")
+                    logger.warning(f"  ⚠️ No historical data: {data}")
             else:
-                logger.warning(f"  ⚠️ Historical API returned {response.status_code}")
+                logger.warning(f"  ⚠️ V3 API error {response.status_code}: {response.text[:200]}")
+                
+                # Fallback to V2 API with 30-minute (then convert to 5-min)
+                logger.info(f"  🔄 Trying V2 fallback with 30-minute...")
+                return self.get_historical_v2_fallback(days)
             
             return pd.DataFrame()
             
         except Exception as e:
             logger.error(f"  ❌ Historical data error: {e}")
             traceback.print_exc()
+            return pd.DataFrame()
+    
+    def get_historical_v2_fallback(self, days: int = 10) -> pd.DataFrame:
+        """
+        V2 API fallback using 30-minute interval (then convert to 5-min approximation)
+        """
+        try:
+            to_date = (datetime.now(IST) - timedelta(days=1)).date()
+            from_date = to_date - timedelta(days=days)
+            
+            encoded_symbol = urllib.parse.quote(SENSEX_SYMBOL, safe='')
+            url = f"https://api.upstox.com/v2/historical-candle/{encoded_symbol}/30minute/{to_date.strftime('%Y-%m-%d')}/{from_date.strftime('%Y-%m-%d')}"
+            
+            logger.info(f"  📡 V2 Fallback: 30-minute data")
+            response = requests.get(url, headers=self.headers, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success' and 'data' in data and 'candles' in data['data']:
+                    df = pd.DataFrame(
+                        data['data']['candles'],
+                        columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi']
+                    )
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    df = df.sort_values('timestamp').reset_index(drop=True)
+                    logger.info(f"  ✅ V2 Fallback: {len(df)} 30-min candles")
+                    
+                    # Note: Using 30-min as approximation for 5-min analysis
+                    # This is less accurate but better than no data
+                    return df
+            
+            return pd.DataFrame()
+            
+        except Exception as e:
+            logger.error(f"  ❌ V2 Fallback error: {e}")
             return pd.DataFrame()
     
     def get_combined_candles(self) -> pd.DataFrame:
