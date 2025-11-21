@@ -26,7 +26,6 @@ import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple
 import pandas as pd
-import html  # NEW: For escaping Markdown special characters
 
 # Optional: Redis for memory (fallback to RAM if not available)
 try:
@@ -80,6 +79,16 @@ class Signal:
     strike: int
     pcr: float
     candle_color: str  # NEW: Track candle direction
+
+# ==================== TELEGRAM MESSAGE FORMATTER ====================
+def escape_markdown_v2(text):
+    """
+    Escape special characters for Telegram MarkdownV2
+    """
+    special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    for char in special_chars:
+        text = text.replace(char, f'\\{char}')
+    return text
 
 # ==================== 1. REDIS BRAIN ====================
 class RedisBrain:
@@ -479,7 +488,7 @@ class DataMonsterBot:
 
     async def send_alert(self, s: Signal):
         """
-        🔥 V11.2 FIX: Escape special characters for Telegram Markdown
+        🔥 V11.2 FIX: Properly escape special characters for Telegram
         """
         if self.last_alert_time:
             diff = (datetime.now(IST) - self.last_alert_time).seconds
@@ -492,12 +501,13 @@ class DataMonsterBot:
         emoji = "🟢" if s.type == "CE_BUY" else "🔴"
         mode_indicator = "🧪 TEST MODE" if OI_TEST_MODE else ""
         
-        # 🔥 CRITICAL FIX: Escape underscores and other special chars
-        safe_type = s.type.replace('_', '\\_')  # PE_BUY → PE\_BUY
-        safe_reason = s.reason.replace('_', '\\_')
+        # 🔥 CRITICAL FIX: Escape special characters properly
+        safe_type = escape_markdown_v2(s.type)
+        safe_reason = escape_markdown_v2(s.reason)
+        version = escape_markdown_v2("V11.2")
         
         msg = f"""
-{emoji} *DATA MONSTER V11\\.2 SIGNAL*
+{emoji} *DATA MONSTER {version} SIGNAL*
 
 🔥 *Action:* {safe_type}
 🎯 *Strike:* {s.strike}
@@ -517,32 +527,46 @@ _Enhanced Price Action Filter Active_
                 await self.telegram.send_message(
                     TELEGRAM_CHAT_ID,
                     msg,
-                    parse_mode='MarkdownV2'  # Changed from 'Markdown' to 'MarkdownV2'
+                    parse_mode='MarkdownV2'
                 )
                 logger.info("✅ Telegram Alert Sent")
             except Exception as e:
                 logger.error(f"Telegram send error: {e}")
                 # Fallback: Send without formatting
                 try:
-                    plain_msg = msg.replace('*', '').replace('_', '').replace('\\', '')
+                    plain_msg = f"""
+{emoji} DATA MONSTER V11.2 SIGNAL
+
+Action: {s.type}
+Strike: {s.strike}
+Logic: {s.reason}
+Confidence: {s.confidence}%
+PCR: {s.pcr:.2f}
+Candle: {s.candle_color}
+
+{mode_indicator}
+"""
                     await self.telegram.send_message(TELEGRAM_CHAT_ID, plain_msg)
                     logger.info("✅ Sent as plain text")
-                except:
-                    pass
+                except Exception as e2:
+                    logger.error(f"Plain text also failed: {e2}")
 
     async def send_startup_message(self):
         """Send Startup Message"""
         now = datetime.now(IST)
+        time_str = escape_markdown_v2(now.strftime('%d-b-%Y %I:%M:%S %p IST'))
+        version = escape_markdown_v2("V11.2")
+        
         startup_msg = f"""
-🚀 *BOT STARTED \\- V11\\.2*
+🚀 *BOT STARTED {version}*
 
-⏰ *Time:* {now.strftime('%d\\-%b\\-%Y %I:%M:%S %p IST')}
+⏰ *Time:* {time_str}
 🔥 *NEW:* False Signal Prevention
-📡 *Strategy:* OI \\+ Price Action \\+ VWAP
+📡 *Strategy:* OI + Price Action + VWAP
 
 🔧 *Filters Active:*
 ✅ Candle Color Check
-✅ 5\\-EMA Trend Filter
+✅ 5 EMA Trend Filter
 ✅ VWAP Confirmation
 {'🧪 TEST MODE: 3% Threshold' if OI_TEST_MODE else '📊 LIVE MODE: 8% Threshold'}
 
@@ -564,6 +588,30 @@ _Signals require 2/3 confirmations_
                 logger.info("✅ Startup Message Sent")
             except Exception as e:
                 logger.error(f"Startup message error: {e}")
+                # Fallback to plain text
+                try:
+                    plain_msg = f"""
+🚀 BOT STARTED V11.2
+
+Time: {now.strftime('%d-%b-%Y %I:%M:%S %p IST')}
+NEW: False Signal Prevention
+Strategy: OI + Price Action + VWAP
+
+Filters Active:
+✅ Candle Color Check
+✅ 5-EMA Trend Filter  
+✅ VWAP Confirmation
+{'🧪 TEST MODE: 3% Threshold' if OI_TEST_MODE else '📊 LIVE MODE: 8% Threshold'}
+
+Scan: 90 seconds
+Expiry: Every Tuesday
+
+Signals require 2/3 confirmations
+"""
+                    await self.telegram.send_message(TELEGRAM_CHAT_ID, plain_msg)
+                    logger.info("✅ Startup sent as plain text")
+                except:
+                    pass
 
 # ==================== MAIN RUNNER ====================
 async def main():
