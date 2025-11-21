@@ -12,6 +12,8 @@ FIXES IN V11.0:
 ✅ VERIFIED: Tuesday Expiry (Sept 2025 onwards)
 ✅ ADDED: API response validation
 ✅ ADDED: Graceful fallback mechanisms
+✅ ADDED: Startup message to Telegram
+✅ ADDED: Test mode (3% threshold for testing)
 
 Accuracy: 85%+ (Based on OI Delta Strategy)
 Speed: Optimized with Redis + Async
@@ -61,6 +63,8 @@ REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
 
 # --- STRATEGY CONSTANTS ---
 OI_CHANGE_THRESHOLD = 8.0   # 8% OI Change = Strong Signal
+OI_TEST_MODE = True         # OPTION 2: Testing Mode (Set False for Live)
+OI_TEST_THRESHOLD = 3.0     # 3% for Testing (More sensitive)
 VOL_MULTIPLIER = 2.0        # Volume Spike Detection
 PCR_BULLISH = 1.1           # PCR > 1.1 = Bullish Sentiment
 PCR_BEARISH = 0.9           # PCR < 0.9 = Bearish Sentiment
@@ -330,23 +334,27 @@ class DataMonsterBot:
         # Save current snapshot
         self.redis.save_snapshot(curr_ce, curr_pe)
         
+        # OPTION 2: Use test threshold if in test mode
+        active_threshold = OI_TEST_THRESHOLD if OI_TEST_MODE else OI_CHANGE_THRESHOLD
+        mode_text = "🧪 TEST MODE" if OI_TEST_MODE else "LIVE"
+        
         logger.info(f"📅 Exp: {expiry} | Price: {price:.1f} | VWAP: {vwap:.1f} | PCR: {pcr:.2f}")
-        logger.info(f"OI Delta (15m): CE {ce_15m:+.1f}% | PE {pe_15m:+.1f}%")
+        logger.info(f"OI Delta (15m): CE {ce_15m:+.1f}% | PE {pe_15m:+.1f}% | {mode_text}")
         
         # Generate Signal
-        signal = self.generate_signal(price, vwap, pcr, ce_5m, pe_5m, ce_15m, pe_15m)
+        signal = self.generate_signal(price, vwap, pcr, ce_5m, pe_5m, ce_15m, pe_15m, active_threshold)
         
         if signal:
             await self.send_alert(signal)
 
-    def generate_signal(self, price, vwap, pcr, ce_5m, pe_5m, ce_15m, pe_15m):
+    def generate_signal(self, price, vwap, pcr, ce_5m, pe_5m, ce_15m, pe_15m, threshold=OI_CHANGE_THRESHOLD):
         """Core Trading Logic"""
         confidence = 60
         strike = round(price/50)*50
         
         # STRATEGY 1: SHORT COVERING (Bullish)
         # Logic: CE OI drops sharply + Price above VWAP
-        if ce_15m < -OI_CHANGE_THRESHOLD and price > vwap:
+        if ce_15m < -threshold and price > vwap:
             confidence = 85
             if ce_5m < -5:  # Fast confirmation
                 confidence = 95
@@ -364,7 +372,7 @@ class DataMonsterBot:
         
         # STRATEGY 2: LONG UNWINDING (Bearish)
         # Logic: PE OI drops sharply + Price below VWAP
-        if pe_15m < -OI_CHANGE_THRESHOLD and price < vwap:
+        if pe_15m < -threshold and price < vwap:
             confidence = 85
             if pe_5m < -5:
                 confidence = 95
@@ -394,6 +402,8 @@ class DataMonsterBot:
         self.last_alert_time = datetime.now(IST)
         
         emoji = "🟢" if s.type == "CE_BUY" else "🔴"
+        mode_indicator = "🧪 TEST MODE" if OI_TEST_MODE else ""
+        
         msg = f"""
 {emoji} *DATA MONSTER V11 SIGNAL*
 
@@ -403,6 +413,7 @@ class DataMonsterBot:
 ⚡ *Confidence:* {s.confidence}%
 📉 *PCR:* {s.pcr:.2f}
 
+{mode_indicator}
 _Pure Data-Driven Signal (Not Financial Advice)_
 """
         
@@ -421,6 +432,42 @@ _Pure Data-Driven Signal (Not Financial Advice)_
             except Exception as e:
                 logger.error(f"Telegram send error: {e}")
 
+    async def send_startup_message(self):
+        """OPTION 1: Send Startup Message to Telegram"""
+        now = datetime.now(IST)
+        startup_msg = f"""
+🚀 *BOT STARTED SUCCESSFULLY*
+
+⏰ *Time:* {now.strftime('%d-%b-%Y %I:%M:%S %p IST')}
+🤖 *Version:* Data Monster V11.0
+📡 *Strategy:* OI Delta + PCR + VWAP
+
+🔧 *Configuration:*
+{'🧪 TEST MODE: 3% Threshold' if OI_TEST_MODE else '📊 LIVE MODE: 8% Threshold'}
+⏱️ Scan Interval: 90 seconds
+📅 Expiry: Every Tuesday
+
+✅ *Status:* All Systems Operational
+🎯 Ready to scan for signals!
+
+_Will notify when strong OI movements detected._
+"""
+        
+        logger.info("📲 Sending Startup Message...")
+        
+        if self.telegram:
+            try:
+                await self.telegram.send_message(
+                    TELEGRAM_CHAT_ID,
+                    startup_msg,
+                    parse_mode='Markdown'
+                )
+                logger.info("✅ Startup Message Sent to Telegram")
+            except Exception as e:
+                logger.error(f"Startup message error: {e}")
+        else:
+            logger.warning("⚠️ Telegram not configured - Startup message skipped")
+
 # ==================== MAIN RUNNER ====================
 async def main():
     bot = DataMonsterBot()
@@ -429,7 +476,7 @@ async def main():
     logger.info("📡 Strategy: OI Delta + PCR + VWAP")
     logger.info("=" * 50)
     
-    # OPTION 1: Send Startup Message to Telegram
+    # OPTION 1: Send Startup Message
     await bot.send_startup_message()
     
     while True:
