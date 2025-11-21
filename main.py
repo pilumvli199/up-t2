@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-NIFTY50 DATA MONSTER V11.3 - PERFECT SIGNAL TIMING
-===================================================
-Strategy: "Trade the Invisible Hand (OI & Volume)"
+NIFTY50 DATA MONSTER V11.5 - REAL VOLUME FIX
+=============================================
+Strategy: "Follow the Smart Money (OI + Volume + VWAP)"
 
-NEW IN V11.3:
-🔥 1-MINUTE CANDLE (No lag, real-time)
-✅ STRICT Candle Direction Match (CE=GREEN, PE=RED only)
-✅ RSI Momentum Filter (Confirms trend strength)
-✅ Multi-timeframe OI confirmation (5m + 15m)
-✅ Price must break VWAP with momentum
+CRITICAL FIX IN V11.5:
+🔥 Uses NIFTY FUTURES for Volume/VWAP (Real traded volume!)
+✅ Enhanced logging (Shows all analysis steps)
+✅ Volume spike now works correctly
+✅ VWAP calculation accurate
 
-Accuracy: 98%+ (With Perfect Timing)
+Spot Index = No volume ❌
+Nifty Futures = Real volume ✅
+
+Target: 40-100 point moves | 75%+ accuracy
 """
 
 import os
@@ -47,26 +49,38 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s', 
     level=logging.INFO
 )
-logger = logging.getLogger("DataMonsterV11.3")
+logger = logging.getLogger("DataMonsterV11.5")
 
 UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN', 'YOUR_TOKEN')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
 
-# --- ENHANCED STRATEGY CONSTANTS ---
-OI_CHANGE_THRESHOLD = 8.0
+# --- INSTRUMENT SYMBOLS ---
+NIFTY_SPOT = "NSE_INDEX|Nifty 50"  # For price only
+NIFTY_FUTURES = "NSE_FO|NIFTY25DEC25FUT"  # For volume/VWAP (Current month)
+
+# NOTE: Update NIFTY_FUTURES symbol monthly:
+# November 2025 expiry: NIFTY25NOV25FUT
+# December 2025 expiry: NIFTY25DEC25FUT
+# January 2026 expiry: NIFTY26JAN26FUT
+
+# --- STRATEGY CONSTANTS ---
+OI_THRESHOLD_STRONG = 8.0
+OI_THRESHOLD_MEDIUM = 5.0
 OI_TEST_MODE = True
 OI_TEST_THRESHOLD = 3.0
+
+VOL_SPIKE_2X = 2.0
+VOL_SPIKE_3X = 3.0
+
+PCR_EXTREME_BULLISH = 1.15
 PCR_BULLISH = 1.08
 PCR_BEARISH = 0.92
-NIFTY_SYMBOL = "NSE_INDEX|Nifty 50"
+PCR_EXTREME_BEARISH = 0.85
 
-# NEW: Advanced Filters
-RSI_PERIOD = 14
-RSI_BULLISH = 45  # CE signal needs RSI > 45
-RSI_BEARISH = 55  # PE signal needs RSI < 55
-MIN_CANDLE_SIZE = 5  # Minimum points for valid candle
+MIN_CANDLE_SIZE = 8
+VWAP_BUFFER = 5
 
 @dataclass
 class Signal:
@@ -75,14 +89,14 @@ class Signal:
     confidence: int
     price: float
     strike: int
+    target_points: int
     pcr: float
     candle_color: str
-    rsi: float
+    volume_surge: float
     oi_5m: float
     oi_15m: float
 
 def escape_markdown_v2(text):
-    """Escape special characters for Telegram MarkdownV2"""
     special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
     for char in special_chars:
         text = text.replace(char, f'\\{char}')
@@ -98,12 +112,12 @@ class RedisBrain:
             try:
                 self.client = redis.from_url(REDIS_URL, decode_responses=True)
                 self.client.ping()
-                logger.info("✅ Redis Connected: OI Time-Travel Enabled")
+                logger.info("✅ Redis Connected")
             except Exception as e:
-                logger.warning(f"⚠️ Redis Failed ({e}): Using RAM Mode")
+                logger.warning(f"⚠️ Redis Failed: Using RAM Mode")
                 self.client = None
         else:
-            logger.info("📦 Running in RAM-only mode")
+            logger.info("📦 RAM-only mode")
 
     def save_snapshot(self, ce_oi, pe_oi):
         now = datetime.now(IST)
@@ -114,8 +128,7 @@ class RedisBrain:
         if self.client:
             try:
                 self.client.setex(key, 7200, data)
-            except Exception as e:
-                logger.error(f"Redis save error: {e}")
+            except:
                 self.memory[key] = data
         else:
             self.memory[key] = data
@@ -142,11 +155,10 @@ class RedisBrain:
             ce_chg = ((current_ce - past['ce']) / past['ce']) * 100 if past['ce'] > 0 else 0
             pe_chg = ((current_pe - past['pe']) / past['pe']) * 100 if past['pe'] > 0 else 0
             return ce_chg, pe_chg
-        except Exception as e:
-            logger.error(f"OI Delta calculation error: {e}")
+        except:
             return 0.0, 0.0
 
-# ==================== DATA FEED ====================
+# ==================== DATA FEED (ENHANCED) ====================
 class DataFeed:
     def __init__(self):
         self.headers = {
@@ -157,33 +169,39 @@ class DataFeed:
         self.retry_delay = 2
 
     async def get_market_data(self) -> Tuple[pd.DataFrame, int, int, str, float]:
+        """
+        🔥 V11.5: Gets FUTURES data for volume, SPOT for price
+        """
         async with aiohttp.ClientSession() as session:
-            enc_symbol = urllib.parse.quote(NIFTY_SYMBOL)
+            enc_spot = urllib.parse.quote(NIFTY_SPOT)
+            enc_futures = urllib.parse.quote(NIFTY_FUTURES)
             
-            ltp_url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={enc_symbol}"
+            # SPOT LTP for accurate price
+            ltp_url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={enc_spot}"
             
+            # FUTURES candles for volume/VWAP
             to_date = datetime.now(IST).strftime('%Y-%m-%d')
             from_date = (datetime.now(IST) - timedelta(days=10)).strftime('%Y-%m-%d')
-            candle_url = f"https://api.upstox.com/v2/historical-candle/{enc_symbol}/1minute/{to_date}/{from_date}"
+            candle_url = f"https://api.upstox.com/v2/historical-candle/{enc_futures}/1minute/{to_date}/{from_date}"
             
             expiry = self._get_weekly_expiry()
-            chain_url = f"https://api.upstox.com/v2/option/chain?instrument_key={enc_symbol}&expiry_date={expiry}"
+            chain_url = f"https://api.upstox.com/v2/option/chain?instrument_key={enc_spot}&expiry_date={expiry}"
             
             df = pd.DataFrame()
             total_ce, total_pe = 0, 0
             spot_price = 0
             
             try:
-                # Get LIVE SPOT
+                # Get SPOT PRICE
+                logger.info("🔍 Fetching Spot Price...")
                 for attempt in range(self.retry_count):
                     try:
                         async with session.get(ltp_url, headers=self.headers) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
                                 possible_keys = [
-                                    NIFTY_SYMBOL,
+                                    NIFTY_SPOT,
                                     "NSE_INDEX:Nifty 50",
-                                    "NSE_INDEX|Nifty50",
                                     "Nifty 50"
                                 ]
                                 
@@ -192,7 +210,7 @@ class DataFeed:
                                         if key in data['data']:
                                             spot_price = data['data'][key].get('last_price', 0)
                                             if spot_price > 0:
-                                                logger.info(f"🎯 LIVE Spot: {spot_price:.2f}")
+                                                logger.info(f"✅ Spot: {spot_price:.2f}")
                                                 break
                                     
                                     if spot_price == 0 and data['data']:
@@ -204,10 +222,11 @@ class DataFeed:
                             elif resp.status == 429:
                                 await asyncio.sleep(self.retry_delay * (attempt + 1))
                     except Exception as e:
-                        logger.error(f"LTP error: {e}")
+                        logger.error(f"Spot fetch error: {e}")
                         await asyncio.sleep(self.retry_delay)
                 
-                # Get 1-MINUTE Candles (NO RESAMPLING!)
+                # Get FUTURES CANDLES (With Real Volume!)
+                logger.info("🔍 Fetching Futures Candles (for Volume/VWAP)...")
                 for attempt in range(self.retry_count):
                     try:
                         async with session.get(candle_url, headers=self.headers) as resp:
@@ -223,19 +242,25 @@ class DataFeed:
                                         df['ts'] = pd.to_datetime(df['ts']).dt.tz_convert(IST)
                                         df = df.sort_values('ts').set_index('ts')
                                         
-                                        # 🔥 KEEP 1-MINUTE DATA (No resample!)
                                         today = datetime.now(IST).date()
                                         df = df[df.index.date == today].tail(100)
                                         
-                                        logger.info(f"✅ 1-min Candles: {len(df)} rows")
+                                        # Log volume stats
+                                        total_vol = df['vol'].sum()
+                                        avg_vol = df['vol'].mean()
+                                        last_vol = df['vol'].iloc[-1] if not df.empty else 0
+                                        
+                                        logger.info(f"✅ Futures Candles: {len(df)}")
+                                        logger.info(f"📊 Volume Stats: Last={last_vol:,.0f} | Avg={avg_vol:,.0f} | Total={total_vol:,.0f}")
                                         break
                             elif resp.status == 429:
                                 await asyncio.sleep(self.retry_delay * (attempt + 1))
                     except Exception as e:
-                        logger.error(f"Candle error: {e}")
+                        logger.error(f"Futures candle error: {e}")
                         await asyncio.sleep(self.retry_delay)
                 
-                # Get Option Chain
+                # Get Option Chain (OI data)
+                logger.info("🔍 Fetching Option Chain (OI)...")
                 atm_strike = round(spot_price / 50) * 50
                 min_strike = atm_strike - 500
                 max_strike = atm_strike + 500
@@ -256,12 +281,12 @@ class DataFeed:
                                             total_ce += ce_oi
                                             total_pe += pe_oi
                                     
-                                    logger.info(f"✅ OI: CE={total_ce:,} | PE={total_pe:,}")
+                                    pcr = total_pe / total_ce if total_ce > 0 else 1.0
+                                    logger.info(f"✅ OI: CE={total_ce:,.0f} | PE={total_pe:,.0f} | PCR={pcr:.2f}")
                                     break
                             elif resp.status == 429:
                                 await asyncio.sleep(self.retry_delay * (attempt + 1))
-                    except Exception as e:
-                        logger.error(f"Option chain error: {e}")
+                    except:
                         await asyncio.sleep(self.retry_delay)
                 
                 return df, total_ce, total_pe, expiry, spot_price
@@ -282,102 +307,100 @@ class DataFeed:
         
         return expiry.strftime('%Y-%m-%d')
 
-# ==================== ENHANCED NUMBER CRUNCHER ====================
-class NumberCruncher:
+# ==================== PURE ANALYZER (WITH LOGGING) ====================
+class PureAnalyzer:
     
     @staticmethod
     def calculate_vwap(df):
-        """Intraday VWAP from 1-min data"""
+        """VWAP from futures volume"""
         if df.empty:
+            logger.warning("⚠️ Empty dataframe for VWAP")
             return 0
         
         df_copy = df.copy()
         df_copy['tp'] = (df_copy['high'] + df_copy['low'] + df_copy['close']) / 3
         df_copy['vol_price'] = df_copy['tp'] * df_copy['vol']
         
+        total_vol = df_copy['vol'].sum()
+        if total_vol == 0:
+            logger.warning("⚠️ Zero volume - Cannot calculate VWAP")
+            return df_copy['close'].iloc[-1]
+        
         vwap = df_copy['vol_price'].cumsum() / df_copy['vol'].cumsum()
-        return vwap.iloc[-1]
+        final_vwap = vwap.iloc[-1]
+        
+        logger.info(f"📊 VWAP Calculated: {final_vwap:.2f}")
+        return final_vwap
 
     @staticmethod
-    def get_last_candle_info(df):
-        """
-        🔥 Get CURRENT 1-minute candle info (No lag!)
-        Returns: (color, size, direction)
-        """
-        if df.empty or len(df) < 1:
-            return 'NEUTRAL', 0, 0
+    def get_candle_info(df):
+        """Current candle analysis"""
+        if df.empty:
+            return 'NEUTRAL', 0
         
         last = df.iloc[-1]
         candle_size = abs(last['close'] - last['open'])
         
         if last['close'] > last['open']:
             color = 'GREEN'
-            direction = 1  # Bullish
         elif last['close'] < last['open']:
             color = 'RED'
-            direction = -1  # Bearish
         else:
             color = 'DOJI'
-            direction = 0
         
-        return color, candle_size, direction
+        logger.info(f"🕯️ Candle: {color} | Size: {candle_size:.1f} pts")
+        return color, candle_size
     
     @staticmethod
-    def calculate_rsi(df, period=14):
+    def check_volume_surge(df):
         """
-        🔥 RSI for momentum confirmation
+        🔥 V11.5: Now works with REAL futures volume!
         """
-        if df.empty or len(df) < period + 1:
-            return 50  # Neutral
+        if df.empty or len(df) < 20:
+            logger.warning("⚠️ Insufficient data for volume analysis")
+            return False, 0
         
-        close_prices = df['close'].values
-        deltas = np.diff(close_prices)
+        current_vol = df['vol'].iloc[-1]
+        avg_vol = df['vol'].iloc[-20:-1].mean()
         
-        gains = np.where(deltas > 0, deltas, 0)
-        losses = np.where(deltas < 0, -deltas, 0)
+        if avg_vol == 0:
+            logger.warning("⚠️ Zero average volume")
+            return False, 0
         
-        avg_gain = np.mean(gains[-period:])
-        avg_loss = np.mean(losses[-period:])
+        multiplier = current_vol / avg_vol
+        has_spike = multiplier >= VOL_SPIKE_2X
         
-        if avg_loss == 0:
-            return 100
+        surge_emoji = "🔥" if multiplier >= VOL_SPIKE_3X else "📈" if has_spike else "📊"
+        logger.info(f"{surge_emoji} Volume: Current={current_vol:,.0f} | Avg={avg_vol:,.0f} | Ratio={multiplier:.2f}x")
         
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        
-        return rsi
+        return has_spike, multiplier
     
     @staticmethod
-    def calculate_ema(df, period=5):
-        """5-period EMA"""
-        if df.empty or len(df) < period:
-            return 0
-        
-        ema = df['close'].ewm(span=period, adjust=False).mean()
-        return ema.iloc[-1]
+    def get_price_distance_from_vwap(price, vwap):
+        """Distance calculation"""
+        distance = abs(price - vwap)
+        direction = "above" if price > vwap else "below"
+        logger.info(f"📏 Price {direction} VWAP by {distance:.1f} pts")
+        return distance
     
     @staticmethod
-    def check_price_momentum(df):
-        """
-        Check if price is building momentum
-        Returns: (is_bullish_momentum, is_bearish_momentum)
-        """
+    def check_momentum_candles(df, direction='bullish'):
+        """Check last 3 candles"""
         if df.empty or len(df) < 3:
-            return False, False
+            return False
         
         last_3 = df.tail(3)
         
-        # Bullish: Last 3 candles mostly green + rising lows
-        green_count = sum(last_3['close'] > last_3['open'])
-        rising_lows = last_3['low'].is_monotonic_increasing
-        bullish = (green_count >= 2) and rising_lows
-        
-        # Bearish: Last 3 candles mostly red + falling highs
-        red_count = sum(last_3['close'] < last_3['open'])
-        falling_highs = last_3['high'].is_monotonic_decreasing
-        bearish = (red_count >= 2) and falling_highs
-        
-        return bullish, bearish
+        if direction == 'bullish':
+            green_count = sum(last_3['close'] > last_3['open'])
+            result = green_count >= 2
+            logger.info(f"📈 Bullish Momentum: {green_count}/3 green candles = {result}")
+            return result
+        else:
+            red_count = sum(last_3['close'] < last_3['open'])
+            result = red_count >= 2
+            logger.info(f"📉 Bearish Momentum: {red_count}/3 red candles = {result}")
+            return result
 
 # ==================== MAIN BOT ====================
 class DataMonsterBot:
@@ -390,212 +413,240 @@ class DataMonsterBot:
         if TELEGRAM_AVAILABLE and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             try:
                 self.telegram = Bot(token=TELEGRAM_BOT_TOKEN)
-                logger.info("✅ Telegram Bot Ready")
+                logger.info("✅ Telegram Ready")
             except Exception as e:
-                logger.warning(f"Telegram init failed: {e}")
+                logger.warning(f"Telegram failed: {e}")
 
     async def run_cycle(self):
-        logger.info("--- 🔢 Market Scan (90s Cycle) ---")
+        logger.info("=" * 80)
+        logger.info("🔢 MARKET SCAN STARTED")
+        logger.info("=" * 80)
         
         df, curr_ce, curr_pe, expiry, live_spot = await self.feed.get_market_data()
         
         if df.empty or curr_ce == 0 or curr_pe == 0 or live_spot == 0:
-            logger.warning("⏳ Waiting for valid data...")
+            logger.warning("⏳ Incomplete data - Waiting for next cycle...")
             return
         
-        # Calculate ALL indicators
-        vwap = NumberCruncher.calculate_vwap(df)
+        logger.info("\n--- CALCULATING INDICATORS ---")
+        
+        # Calculate indicators
+        vwap = PureAnalyzer.calculate_vwap(df)
         pcr = curr_pe / curr_ce if curr_ce > 0 else 1.0
-        candle_color, candle_size, direction = NumberCruncher.get_last_candle_info(df)
-        rsi = NumberCruncher.calculate_rsi(df, RSI_PERIOD)
-        ema5 = NumberCruncher.calculate_ema(df, 5)
-        bullish_momentum, bearish_momentum = NumberCruncher.check_price_momentum(df)
+        candle_color, candle_size = PureAnalyzer.get_candle_info(df)
+        has_volume_spike, vol_multiplier = PureAnalyzer.check_volume_surge(df)
+        vwap_distance = PureAnalyzer.get_price_distance_from_vwap(live_spot, vwap)
         
         # OI Deltas
+        logger.info("\n--- OI ANALYSIS ---")
         ce_5m, pe_5m = self.redis.get_oi_delta(curr_ce, curr_pe, 5)
         ce_15m, pe_15m = self.redis.get_oi_delta(curr_ce, curr_pe, 15)
+        logger.info(f"📊 OI-5m: CE={ce_5m:+.1f}% | PE={pe_5m:+.1f}%")
+        logger.info(f"📊 OI-15m: CE={ce_15m:+.1f}% | PE={pe_15m:+.1f}%")
         
         self.redis.save_snapshot(curr_ce, curr_pe)
         
-        active_threshold = OI_TEST_THRESHOLD if OI_TEST_MODE else OI_CHANGE_THRESHOLD
-        mode_text = "🧪 TEST" if OI_TEST_MODE else "LIVE"
+        active_threshold = OI_TEST_THRESHOLD if OI_TEST_MODE else OI_THRESHOLD_MEDIUM
+        mode = "🧪 TEST MODE" if OI_TEST_MODE else "📊 LIVE MODE"
         
-        logger.info(f"📅 Exp: {expiry}")
-        logger.info(f"💰 Price: {live_spot:.1f} | VWAP: {vwap:.1f} | EMA5: {ema5:.1f}")
-        logger.info(f"📊 PCR: {pcr:.2f} | RSI: {rsi:.1f}")
-        logger.info(f"🕯️ Candle: {candle_color} (Size: {candle_size:.1f}) | Momentum: {'📈' if bullish_momentum else '📉' if bearish_momentum else '➡️'}")
-        logger.info(f"📈 OI (5m): CE {ce_5m:+.1f}% | PE {pe_5m:+.1f}%")
-        logger.info(f"📊 OI (15m): CE {ce_15m:+.1f}% | PE {pe_15m:+.1f}% | {mode_text}")
+        logger.info(f"\n--- MARKET SUMMARY ---")
+        logger.info(f"📅 Expiry: {expiry} | {mode}")
+        logger.info(f"💰 Spot: {live_spot:.1f} | VWAP: {vwap:.1f}")
+        logger.info(f"📊 PCR: {pcr:.2f}")
         
-        # Generate Signal with STRICT filters
-        signal = self.generate_signal(
-            live_spot, vwap, pcr, rsi, ema5,
+        # Generate signal
+        logger.info("\n--- SIGNAL GENERATION ---")
+        signal = self.generate_pure_signal(
+            live_spot, vwap, vwap_distance, pcr,
             ce_5m, pe_5m, ce_15m, pe_15m,
             active_threshold, candle_color, candle_size,
-            bullish_momentum, bearish_momentum
+            has_volume_spike, vol_multiplier, df
         )
         
         if signal:
             await self.send_alert(signal)
+        else:
+            logger.info("✋ No signal - Waiting for setup...")
+        
+        logger.info("=" * 80)
 
-    def generate_signal(self, price, vwap, pcr, rsi, ema5,
-                       ce_5m, pe_5m, ce_15m, pe_15m,
-                       threshold, candle_color, candle_size,
-                       bullish_momentum, bearish_momentum):
-        """
-        🔥 V11.3: ULTRA-STRICT Signal Logic
-        
-        CE_BUY Requirements (ALL must be TRUE):
-        1. CE OI falling (Short covering)
-        2. Price > VWAP (Above value area)
-        3. RSI > 45 (Bullish momentum)
-        4. GREEN candle (Buyers active NOW)
-        5. Bullish momentum (Last 3 candles)
-        
-        PE_BUY Requirements (ALL must be TRUE):
-        1. PE OI falling (Long unwinding)
-        2. Price < VWAP (Below value area)
-        3. RSI < 55 (Bearish momentum)
-        4. RED candle (Sellers active NOW)
-        5. Bearish momentum (Last 3 candles)
-        """
+    def generate_pure_signal(self, price, vwap, vwap_dist, pcr,
+                            ce_5m, pe_5m, ce_15m, pe_15m,
+                            threshold, candle_color, candle_size,
+                            has_vol_spike, vol_mult, df):
+        """Pure OI + Volume strategy with detailed logging"""
         
         strike = round(price/50)*50
         
-        # ============ STRATEGY 1: CE_BUY (Bullish) ============
+        # CE_BUY Check
         if ce_15m < -threshold:
-            logger.info(f"🔍 CE Signal Check: OI {ce_15m:.1f}%")
+            logger.info(f"\n🔍 CE SIGNAL ANALYSIS (OI: {ce_15m:.1f}%)")
+            logger.info("-" * 60)
             
-            # STRICT Checklist
+            if abs(ce_15m) >= OI_THRESHOLD_STRONG:
+                expected_move = 80
+            else:
+                expected_move = 50
+            
             checks = {
+                "CE OI Falling": ce_15m < -threshold,
                 "Price > VWAP": price > vwap,
-                "Price > EMA5": price > ema5,
-                "RSI Bullish": rsi > RSI_BULLISH,
                 "GREEN Candle": candle_color == 'GREEN',
-                "Candle Size OK": candle_size >= MIN_CANDLE_SIZE,
-                "Bullish Momentum": bullish_momentum,
-                "PCR Bullish": pcr > PCR_BULLISH
+                "Volume Surge": has_vol_spike
+            }
+            
+            bonus = {
+                "Strong OI (5m)": ce_5m < -5,
+                "Big Candle": candle_size >= MIN_CANDLE_SIZE,
+                "Far from VWAP": vwap_dist >= VWAP_BUFFER,
+                "Bullish PCR": pcr > PCR_BULLISH,
+                "3x Volume": vol_mult >= VOL_SPIKE_3X,
+                "Momentum": PureAnalyzer.check_momentum_candles(df, 'bullish')
             }
             
             passed = sum(checks.values())
-            total = len(checks)
+            bonus_passed = sum(bonus.values())
             
-            # Log each check
+            logger.info("MAIN CHECKS (All 4 required):")
             for name, result in checks.items():
-                logger.info(f"  {'✅' if result else '❌'} {name}: {result}")
+                logger.info(f"  {'✅' if result else '❌'} {name}")
             
-            # REQUIRE: 6/7 checks (Allow 1 miss for flexibility)
-            if passed >= 6:
-                confidence = 85
-                if ce_5m < -5:  # Strong 5-min confirmation
-                    confidence = 95
-                if passed == total:  # Perfect score
-                    confidence = 100
-                
-                logger.info(f"✅ CE SIGNAL APPROVED: {passed}/{total} checks passed")
+            logger.info(f"\nBONUS CHECKS ({bonus_passed}/6):")
+            for name, result in bonus.items():
+                logger.info(f"  {'✅' if result else '❌'} {name}")
+            
+            if passed == 4:
+                confidence = 75 + (bonus_passed * 3)
+                logger.info(f"\n🎯 CE SIGNAL APPROVED!")
+                logger.info(f"   Confidence: {confidence}% (4/4 main + {bonus_passed}/6 bonus)")
+                logger.info(f"   Expected Move: {expected_move}+ points")
                 
                 return Signal(
                     "CE_BUY",
                     f"SHORT COVERING (OI: {ce_15m:.1f}%)",
-                    confidence,
+                    min(confidence, 95),
                     price,
                     strike,
+                    expected_move,
                     pcr,
                     candle_color,
-                    rsi,
+                    vol_mult,
                     ce_5m,
                     ce_15m
                 )
             else:
-                logger.info(f"❌ CE SIGNAL REJECTED: Only {passed}/{total} checks")
+                logger.info(f"\n❌ CE SIGNAL REJECTED: Only {passed}/4 main checks passed")
                 return None
         
-        # ============ STRATEGY 2: PE_BUY (Bearish) ============
+        # PE_BUY Check
         if pe_15m < -threshold:
-            logger.info(f"🔍 PE Signal Check: OI {pe_15m:.1f}%")
+            logger.info(f"\n🔍 PE SIGNAL ANALYSIS (OI: {pe_15m:.1f}%)")
+            logger.info("-" * 60)
             
-            # STRICT Checklist
+            if abs(pe_15m) >= OI_THRESHOLD_STRONG:
+                expected_move = 80
+            else:
+                expected_move = 50
+            
             checks = {
+                "PE OI Falling": pe_15m < -threshold,
                 "Price < VWAP": price < vwap,
-                "Price < EMA5": price < ema5,
-                "RSI Bearish": rsi < RSI_BEARISH,
                 "RED Candle": candle_color == 'RED',
-                "Candle Size OK": candle_size >= MIN_CANDLE_SIZE,
-                "Bearish Momentum": bearish_momentum,
-                "PCR Bearish": pcr < PCR_BEARISH
+                "Volume Surge": has_vol_spike
+            }
+            
+            bonus = {
+                "Strong OI (5m)": pe_5m < -5,
+                "Big Candle": candle_size >= MIN_CANDLE_SIZE,
+                "Far from VWAP": vwap_dist >= VWAP_BUFFER,
+                "Bearish PCR": pcr < PCR_BEARISH,
+                "3x Volume": vol_mult >= VOL_SPIKE_3X,
+                "Momentum": PureAnalyzer.check_momentum_candles(df, 'bearish')
             }
             
             passed = sum(checks.values())
-            total = len(checks)
+            bonus_passed = sum(bonus.values())
             
+            logger.info("MAIN CHECKS (All 4 required):")
             for name, result in checks.items():
-                logger.info(f"  {'✅' if result else '❌'} {name}: {result}")
+                logger.info(f"  {'✅' if result else '❌'} {name}")
             
-            # REQUIRE: 6/7 checks
-            if passed >= 6:
-                confidence = 85
-                if pe_5m < -5:
-                    confidence = 95
-                if passed == total:
-                    confidence = 100
-                
-                logger.info(f"✅ PE SIGNAL APPROVED: {passed}/{total} checks passed")
+            logger.info(f"\nBONUS CHECKS ({bonus_passed}/6):")
+            for name, result in bonus.items():
+                logger.info(f"  {'✅' if result else '❌'} {name}")
+            
+            if passed == 4:
+                confidence = 75 + (bonus_passed * 3)
+                logger.info(f"\n🎯 PE SIGNAL APPROVED!")
+                logger.info(f"   Confidence: {confidence}% (4/4 main + {bonus_passed}/6 bonus)")
+                logger.info(f"   Expected Move: {expected_move}+ points")
                 
                 return Signal(
                     "PE_BUY",
                     f"LONG UNWINDING (OI: {pe_15m:.1f}%)",
-                    confidence,
+                    min(confidence, 95),
                     price,
                     strike,
+                    expected_move,
                     pcr,
                     candle_color,
-                    rsi,
+                    vol_mult,
                     pe_5m,
                     pe_15m
                 )
             else:
-                logger.info(f"❌ PE SIGNAL REJECTED: Only {passed}/{total} checks")
+                logger.info(f"\n❌ PE SIGNAL REJECTED: Only {passed}/4 main checks passed")
                 return None
         
+        logger.info("ℹ️ No OI trigger detected")
         return None
 
     async def send_alert(self, s: Signal):
-        """Send Telegram Alert"""
+        """Send alert"""
         if self.last_alert_time:
             diff = (datetime.now(IST) - self.last_alert_time).seconds
             if diff < 300:
-                logger.info("⏳ Rate Limited - Alert Suppressed")
+                logger.info("⏳ Rate Limited (Last alert < 5 min)")
                 return
         
         self.last_alert_time = datetime.now(IST)
         
         emoji = "🟢" if s.type == "CE_BUY" else "🔴"
-        mode = "🧪 TEST MODE" if OI_TEST_MODE else "📊 LIVE MODE"
+        mode = "🧪 TEST" if OI_TEST_MODE else "📊 LIVE"
         
-        # Plain text fallback (no markdown issues)
+        # Calculate target
+        if s.type == "CE_BUY":
+            target = s.price + s.target_points
+        else:
+            target = s.price - s.target_points
+        
         msg = f"""
-{emoji} DATA MONSTER V11.3 SIGNAL
+{emoji} NIFTY SIGNAL V11.5
 
 Action: {s.type}
+Entry: {s.price:.1f}
+Target: {target:.1f} ({s.target_points}+ points)
 Strike: {s.strike}
+
 Logic: {s.reason}
 Confidence: {s.confidence}%
 
 Market Data:
-Price: {s.price:.1f}
 PCR: {s.pcr:.2f}
-RSI: {s.rsi:.1f}
 Candle: {s.candle_color}
+Volume: {s.volume_surge:.1f}x
 
-OI Delta:
+OI Movement:
 5-min: {s.oi_5m:+.1f}%
 15-min: {s.oi_15m:+.1f}%
 
 {mode}
-Perfect Timing System Active
+Real Futures Volume Strategy
 """
         
-        logger.info(f"🚨 SIGNAL: {s.type} @ {s.strike} (Conf: {s.confidence}%)")
+        logger.info(f"\n🚨 SIGNAL GENERATED!")
+        logger.info(f"   {s.type} @ {s.price:.1f} → Target: {target:.1f}")
+        logger.info(f"   Confidence: {s.confidence}%")
         
         if self.telegram:
             try:
@@ -605,44 +656,54 @@ Perfect Timing System Active
                 logger.error(f"Telegram error: {e}")
 
     async def send_startup_message(self):
-        """Startup notification"""
         now = datetime.now(IST)
         msg = f"""
-🚀 BOT STARTED V11.3
+🚀 BOT V11.5 STARTED
 
-Time: {now.strftime('%d-%b-%Y %I:%M:%S %p IST')}
+Time: {now.strftime('%d-%b %I:%M %p')}
 
-NEW FEATURES:
-✅ 1-minute candle (Zero lag)
-✅ RSI momentum filter
-✅ 7-point validation system
-✅ Strict candle color match
-✅ 3-candle momentum check
+CRITICAL FIX:
+✅ Using NIFTY FUTURES for volume
+✅ Real traded volume data
+✅ Accurate VWAP calculation
+✅ Volume spike detection working
 
-{'🧪 TEST MODE: 3% Threshold' if OI_TEST_MODE else '📊 LIVE MODE: 8% Threshold'}
+PURE STRATEGY:
+✅ OI Delta (Smart money)
+✅ Volume Surge (Confirmation)
+✅ VWAP (Value zone)
+✅ Candle (Price action)
 
-Scan: 90 seconds
-Expiry: Every Tuesday
+Target: 40-100 point moves
+Accuracy Goal: 75%+
 
-Signals require 6/7 validations
+{'🧪 TEST: 3% threshold' if OI_TEST_MODE else '📊 LIVE: 5% threshold'}
+
+Scan: Every 90 seconds
+
+NOTE: Update NIFTY_FUTURES symbol monthly
+Current: {NIFTY_FUTURES}
 """
         
-        logger.info("📲 Sending Startup...")
+        logger.info("📲 Sending startup message...")
         
         if self.telegram:
             try:
                 await self.telegram.send_message(TELEGRAM_CHAT_ID, msg)
-                logger.info("✅ Startup Sent")
+                logger.info("✅ Startup sent")
             except Exception as e:
                 logger.error(f"Startup error: {e}")
 
-# ==================== MAIN RUNNER ====================
+# ==================== MAIN ====================
 async def main():
     bot = DataMonsterBot()
-    logger.info("=" * 60)
-    logger.info("🚀 DATA MONSTER V11.3 - PERFECT SIGNAL TIMING")
-    logger.info("📡 1-Min Candles | RSI | 7-Point Validation")
-    logger.info("=" * 60)
+    logger.info("=" * 80)
+    logger.info("🚀 DATA MONSTER V11.5 - REAL VOLUME FIX")
+    logger.info("=" * 80)
+    logger.info(f"📊 Using: {NIFTY_FUTURES} for Volume/VWAP")
+    logger.info(f"🎯 Using: {NIFTY_SPOT} for Price/OI")
+    logger.info(f"🎯 Target: 40-100 point moves | 75%+ accuracy")
+    logger.info("=" * 80)
     
     await bot.send_startup_message()
     
@@ -654,7 +715,7 @@ async def main():
                 await bot.run_cycle()
                 await asyncio.sleep(90)
             else:
-                logger.info("🌙 Market Closed - Waiting...")
+                logger.info("🌙 Market Closed - Sleeping...")
                 await asyncio.sleep(300)
                 
         except KeyboardInterrupt:
@@ -662,6 +723,7 @@ async def main():
             break
         except Exception as e:
             logger.error(f"💥 Critical Error: {e}")
+            logger.error(f"   Waiting 30s before retry...")
             await asyncio.sleep(30)
 
 if __name__ == "__main__":
