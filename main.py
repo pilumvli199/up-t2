@@ -177,19 +177,45 @@ class DataFeed:
                         async with session.get(ltp_url, headers=self.headers) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
-                                if 'data' in data and NIFTY_SYMBOL in data['data']:
-                                    spot_price = data['data'][NIFTY_SYMBOL]['last_price']
-                                    logger.info(f"🎯 LIVE Spot Price: {spot_price:.2f}")
+                                logger.info(f"LTP API Response: {data}")
+                                
+                                # Try multiple possible keys for Nifty
+                                possible_keys = [
+                                    NIFTY_SYMBOL,
+                                    "NSE_INDEX:Nifty 50",
+                                    "NSE_INDEX|Nifty50",
+                                    "Nifty 50"
+                                ]
+                                
+                                if 'data' in data:
+                                    for key in possible_keys:
+                                        if key in data['data']:
+                                            spot_price = data['data'][key].get('last_price', 0)
+                                            if spot_price > 0:
+                                                logger.info(f"🎯 LIVE Spot Price: {spot_price:.2f} (Key: {key})")
+                                                break
+                                    
+                                    # If still 0, try first available key
+                                    if spot_price == 0 and data['data']:
+                                        first_key = list(data['data'].keys())[0]
+                                        spot_price = data['data'][first_key].get('last_price', 0)
+                                        logger.info(f"🎯 LIVE Spot (Fallback): {spot_price:.2f}")
+                                
+                                if spot_price > 0:
                                     break
                             elif resp.status == 429:
+                                logger.warning(f"Rate Limited on LTP API")
                                 await asyncio.sleep(self.retry_delay * (attempt + 1))
+                            else:
+                                logger.error(f"LTP API Status: {resp.status}")
+                                await asyncio.sleep(self.retry_delay)
                     except Exception as e:
                         logger.error(f"LTP fetch error (attempt {attempt+1}): {e}")
                         await asyncio.sleep(self.retry_delay)
                 
+                # FALLBACK: Use candle data if LTP fails
                 if spot_price == 0:
-                    logger.error("❌ Failed to get Live Spot Price")
-                    return df, 0, 0, expiry, 0
+                    logger.warning("⚠️ LTP API failed - Using candle fallback")
                 
                 # STEP 2: Fetch Candle Data (For VWAP calculation)
                 for attempt in range(self.retry_count):
