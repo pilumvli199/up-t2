@@ -885,29 +885,32 @@ class StrikeMasterBot:
         
         mode = "🧪 ALERT ONLY" if ALERT_ONLY_MODE else "⚡ LIVE TRADING"
         
+        # Format timestamp outside f-string to avoid backslash issue
+        timestamp_str = s.timestamp.strftime('%d-%b %I:%M %p')
+        
         msg = f"""
-{emoji} *NIFTY STRIKE MASTER V12\\.0*
+{emoji} NIFTY STRIKE MASTER V12.0
 
-*{mode}*
-
-━━━━━━━━━━━━━━━━━━━━━━━━
-*SIGNAL: {s.type}*
-━━━━━━━━━━━━━━━━━━━━━━━━
-
-📍 *Entry:* {entry:.1f}
-🎯 *Target:* {target:.1f} \\({s.target_points:+.0f} pts\\)
-🛑 *Stop Loss:* {stop_loss:.1f} \\({s.stop_loss_points:.0f} pts\\)
-📊 *Strike:* {s.strike}
+{mode}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-*LOGIC*
+SIGNAL: {s.type}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+📍 Entry: {entry:.1f}
+🎯 Target: {target:.1f} ({s.target_points:+.0f} pts)
+🛑 Stop Loss: {stop_loss:.1f} ({s.stop_loss_points:.0f} pts)
+📊 Strike: {s.strike}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+LOGIC
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
 {s.reason}
-*Confidence:* {s.confidence}%
+Confidence: {s.confidence}%
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-*MARKET DATA*
+MARKET DATA
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
 💰 Spot: {s.spot_price:.1f}
@@ -918,7 +921,7 @@ class StrikeMasterBot:
 📏 ATR: {s.atr:.1f}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-*OI ANALYSIS*
+OI ANALYSIS
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
 ATM Strike Battle:
@@ -926,16 +929,16 @@ ATM Strike Battle:
   PE: {s.atm_pe_change:+.1f}%
 
 Total OI Movement:
-  5\\-min: {s.oi_5m:+.1f}%
-  15\\-min: {s.oi_15m:+.1f}%
+  5-min: {s.oi_5m:+.1f}%
+  15-min: {s.oi_15m:+.1f}%
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-⏰ {s.timestamp.strftime('%d\\-%b %I:%M %p')}
+⏰ {timestamp_str}
 
-✅ 5\\-Strike Focus
-✅ Multi\\-Factor Analysis
-✅ 80%\\+ Target Accuracy
+✅ 5-Strike Focus
+✅ Multi-Factor Analysis
+✅ 80%+ Target Accuracy
 """
         
         logger.info(f"\n🚨 SIGNAL GENERATED!")
@@ -947,22 +950,11 @@ Total OI Movement:
             try:
                 await self.telegram.send_message(
                     chat_id=TELEGRAM_CHAT_ID,
-                    text=msg,
-                    parse_mode='MarkdownV2'
+                    text=msg
                 )
                 logger.info("✅ Alert sent to Telegram")
             except Exception as e:
                 logger.error(f"❌ Telegram error: {e}")
-                # Fallback: send plain text
-                try:
-                    plain_msg = msg.replace('*', '').replace('\\', '')
-                    await self.telegram.send_message(
-                        chat_id=TELEGRAM_CHAT_ID,
-                        text=plain_msg
-                    )
-                    logger.info("✅ Alert sent (plain text)")
-                except:
-                    logger.error("❌ Failed to send alert")
         else:
             logger.info("📱 Alert ready (Telegram not configured)")
     
@@ -973,50 +965,53 @@ Total OI Movement:
         
         mode = "🧪 ALERT ONLY MODE" if ALERT_ONLY_MODE else "⚡ LIVE TRADING MODE"
         
+        # Format timestamp outside f-string
+        startup_time = now.strftime('%d-%b %I:%M %p')
+        
         msg = f"""
-🚀 *STRIKE MASTER V12\\.0 ONLINE*
+🚀 STRIKE MASTER V12.0 ONLINE
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-*STATUS*
+STATUS
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-⏰ Started: {now.strftime('%d\\-%b %I:%M %p')}
+⏰ Started: {startup_time}
 📊 Mode: {mode}
 🔄 Scan: Every {SCAN_INTERVAL}s
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-*CONFIGURATION*
+CONFIGURATION
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-📈 Futures: `{futures_sym}`
-🎯 Strikes: 5 \\(ATM ± 2\\)
+📈 Futures: {futures_sym}
+🎯 Strikes: 5 (ATM ± 2)
 ⏰ Time Filters: Active
-📏 Stop Loss: ATR\\-based
-🎲 Target: 50\\-80 points
+📏 Stop Loss: ATR-based
+🎲 Target: 50-80 points
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-*STRATEGY*
+STRATEGY
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
 ✅ ATM Strike Battle Analysis
-✅ Multi\\-Factor Scoring
+✅ Multi-Factor Scoring
 ✅ Volume Surge Detection
 ✅ VWAP Confirmation
 ✅ PCR Trend Analysis
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-*THRESHOLDS*
+THRESHOLDS
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-OI Unwinding: {OI_THRESHOLD_MEDIUM}%\\+
-ATM OI: {ATM_OI_THRESHOLD}%\\+
-Volume Spike: {VOL_SPIKE_2X}x\\+
-Confidence: 75%\\+
+OI Unwinding: {OI_THRESHOLD_MEDIUM}%+
+ATM OI: {ATM_OI_THRESHOLD}%+
+Volume Spike: {VOL_SPIKE_2X}x+
+Confidence: 75%+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-🎯 Target Accuracy: 80%\\+
-⚡ Ready to scan\\!
+🎯 Target Accuracy: 80%+
+⚡ Ready to scan!
 """
         
         logger.info("📲 Sending startup notification...")
@@ -1025,8 +1020,7 @@ Confidence: 75%\\+
             try:
                 await self.telegram.send_message(
                     chat_id=TELEGRAM_CHAT_ID,
-                    text=msg,
-                    parse_mode='MarkdownV2'
+                    text=msg
                 )
                 logger.info("✅ Startup notification sent")
             except Exception as e:
