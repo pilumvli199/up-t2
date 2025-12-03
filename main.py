@@ -163,6 +163,9 @@ class Config:
     OHLC_URL = "https://api.upstox.com/v2/market-quote/ohlc"
     CANDLE_URL = "https://api.upstox.com/v2/historical-candle/intraday"
     OPTION_CHAIN_URL = "https://api.upstox.com/v2/option/chain"
+    
+    # Use 'symbol' parameter (some endpoints need this instead of instrument_key)
+    USE_SYMBOL_PARAM = True
 
 CFG = Config()
 
@@ -620,9 +623,14 @@ class DataFeed:
                         wait = 2 ** (attempt + 1)
                         logger.warning(f"⏳ Rate limited, wait {wait}s")
                         await asyncio.sleep(wait)
+                    elif resp.status == 401:
+                        logger.error(f"❌ HTTP 401: Token expired or invalid!")
+                        text = await resp.text()
+                        logger.error(f"   Response: {text[:200]}")
+                        return None
                     else:
                         text = await resp.text()
-                        logger.warning(f"⚠️ HTTP {resp.status}: {text[:100]}")
+                        logger.warning(f"⚠️ HTTP {resp.status}: {text[:200]}")
                         await asyncio.sleep(2)
             except asyncio.TimeoutError:
                 logger.warning(f"⏱️ Timeout {attempt + 1}/3")
@@ -635,30 +643,69 @@ class DataFeed:
     async def get_spot_quote(self) -> dict:
         """Get NIFTY Spot LTP + OHLC"""
         async with aiohttp.ClientSession() as session:
+            # Use 'symbol' parameter for quotes API
             key = urllib.parse.quote(CFG.SPOT_KEY)
-            url = f"{CFG.QUOTE_URL}?instrument_key={key}"
+            url = f"{CFG.QUOTE_URL}?symbol={key}"
+            logger.info(f"🔍 Fetching spot from: {url[:80]}...")
+            
             data = await self._fetch(url, session)
-            if data and data.get('status') == 'success':
-                quote = data.get('data', {}).get(CFG.SPOT_KEY, {})
-                ltp = quote.get('last_price', 0)
-                ohlc = quote.get('ohlc', {})
+            
+            if data:
+                logger.debug(f"📥 Response status: {data.get('status')}")
                 
-                # Track day OHLC for TWAP
-                if ltp > 0:
-                    if self.day_open == 0:
-                        self.day_open = ohlc.get('open', ltp)
-                    if ltp > self.day_high:
-                        self.day_high = ltp
-                    if ltp < self.day_low:
-                        self.day_low = ltp
+                if data.get('status') == 'success':
+                    data_dict = data.get('data', {})
+                    
+                    # Try multiple key formats (Upstox uses different formats)
+                    possible_keys = [
+                        CFG.SPOT_KEY,                    # NSE_INDEX|Nifty 50
+                        'NSE_INDEX:Nifty 50',            # Colon format
+                        'NSE_INDEX|NIFTY 50',            # Uppercase
+                        'NSE_INDEX:NIFTY 50',            # Uppercase with colon
+                    ]
+                    
+                    quote = None
+                    for k in possible_keys:
+                        if k in data_dict:
+                            quote = data_dict[k]
+                            logger.info(f"✅ Found spot with key: {k}")
+                            break
+                    
+                    # If still not found, try first key
+                    if not quote and data_dict:
+                        first_key = list(data_dict.keys())[0]
+                        quote = data_dict[first_key]
+                        logger.info(f"✅ Using first key: {first_key}")
+                    
+                    if quote:
+                        ltp = quote.get('last_price', 0)
+                        ohlc = quote.get('ohlc', {})
+                        
+                        logger.info(f"✅ Spot LTP: ₹{ltp}")
+                        
+                        # Track day OHLC for TWAP
+                        if ltp > 0:
+                            if self.day_open == 0:
+                                self.day_open = ohlc.get('open', ltp)
+                            if ltp > self.day_high:
+                                self.day_high = ltp
+                            if ltp < self.day_low:
+                                self.day_low = ltp
+                        
+                        return {
+                            'ltp': ltp,
+                            'open': ohlc.get('open', 0),
+                            'high': ohlc.get('high', 0),
+                            'low': ohlc.get('low', 0),
+                            'close': ohlc.get('close', 0)
+                        }
+                    else:
+                        logger.warning(f"⚠️ No quote data. Available keys: {list(data_dict.keys())[:3]}")
+                else:
+                    logger.warning(f"⚠️ API returned: {data.get('status')} - {data.get('message', 'No message')}")
+            else:
+                logger.warning("⚠️ No response from spot API")
                 
-                return {
-                    'ltp': ltp,
-                    'open': ohlc.get('open', 0),
-                    'high': ohlc.get('high', 0),
-                    'low': ohlc.get('low', 0),
-                    'close': ohlc.get('close', 0)
-                }
         return {'ltp': 0, 'open': 0, 'high': 0, 'low': 0, 'close': 0}
     
     async def get_futures_candles(self, limit: int = 100) -> List:
