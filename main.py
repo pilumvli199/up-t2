@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-    NIFTY50 STRIKE MASTER PRO v2.1 - FULLY AUTONOMOUS TRADING SYSTEM
+    NIFTY50 STRIKE MASTER PRO v2.2 - FULLY AUTONOMOUS TRADING SYSTEM
 ================================================================================
 
-✅ FIXED IN v2.1:
-   - Spot LTP for signals (not futures)
-   - Options Volume for confirmation (CE+PE based)
-   - OI Velocity tracking (movement strength)
-   - OI vs Price Divergence detection
-   - Cumulative OI Trend tracking
-   - Movement Status Prediction (TRENDING/EXHAUSTING/SIDEWAYS/REVERSAL)
-   - ATR-based Trailing SL (proper)
-   - 7 strikes for analysis, OTM for trading
-   - Better Railway.app logging
-   - All endpoints verified
+✅ NEW IN v2.2:
+   - 30 strikes fetch (ATM ± 15) for wide coverage
+   - 7 strikes for OI analysis (ATM ± 3)
+   - Deep OTM trading (4-5 strikes away, ₹20-50 premium)
+   - 9:10 AM start with Yesterday OI baseline
+   - 5 sec polling during opening (9:20-9:45)
+   - 30 sec polling normal hours
+   - Max premium cap ₹60 (affordable with ₹5000)
+   - Aggressive opening mode
 
 📊 TRADING LOGIC (90% OI/Volume, 10% Candle):
    - Entry: OI unwinding + Volume surge + Spot confirmation
@@ -24,11 +22,11 @@
 ⚙️ SETTINGS:
    - Demo Capital: ₹5,000
    - Lot Size: 75 (NSE Dec 2025)
-   - Analysis: 7 strikes (ATM ± 3)
-   - Trading: OTM strikes (cheaper premium)
+   - Fetch: 30 strikes | Analysis: 7 strikes
+   - Trade: Deep OTM (₹20-60 premium max)
 
 Author: Claude AI
-Version: 2.1
+Version: 2.2
 Date: December 2025
 ================================================================================
 """
@@ -50,7 +48,6 @@ import gzip
 from enum import Enum
 
 # ==================== LOGGING SETUP (Railway Compatible) ====================
-# Force unbuffered output for Railway.app
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
@@ -58,11 +55,9 @@ logging.basicConfig(
     format='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
     level=logging.INFO,
     datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("NIFTY-v2.1")
+logger = logging.getLogger("NIFTY-v2.2")
 logger.setLevel(logging.INFO)
 
 # ==================== OPTIONAL DEPENDENCIES ====================
@@ -108,24 +103,28 @@ class Config:
     MAX_TRADES_PER_DAY = 5
     MAX_LOSS_PER_DAY = 250.0
     MAX_OPEN_POSITIONS = 2
-    HARD_STOP_LOSS_POINTS = 5
+    HARD_STOP_LOSS_POINTS = 3  # Tight SL for opening
+    NORMAL_STOP_LOSS_POINTS = 5  # Normal hours SL
     
-    # Strike Configuration
-    ANALYSIS_STRIKES = 3  # ATM ± 3 = 7 strikes for analysis
-    OTM_STRIKES_AWAY = 2  # Trade 2 strikes OTM
+    # Strike Configuration - UPDATED v2.2
+    FETCH_STRIKES = 15      # ATM ± 15 = 31 strikes for fetching
+    ANALYSIS_STRIKES = 3    # ATM ± 3 = 7 strikes for OI analysis
+    OTM_STRIKES_AWAY = 4    # Trade 4-5 strikes OTM for cheap premium
+    MAX_PREMIUM = 60.0      # Max ₹60 premium (₹60 × 75 = ₹4,500)
+    MIN_PREMIUM = 15.0      # Min ₹15 premium (too cheap = illiquid)
     
     # OI Thresholds
     OI_ENTRY_THRESHOLD = 5.0
     OI_STRONG_THRESHOLD = 8.0
-    ATM_OI_THRESHOLD = 5.0
+    OI_OPENING_THRESHOLD = 3.0  # Lower threshold for opening
     OI_EXIT_REVERSAL = 3.0
-    OI_VELOCITY_STRONG = 0.5  # % per minute
+    OI_VELOCITY_STRONG = 0.5
     OI_VELOCITY_WEAK = 0.1
     
     # Volume
-    VOLUME_SPIKE_MULTIPLIER = 2.0
-    ORDER_FLOW_BULLISH = 0.8  # CE_vol/PE_vol < 0.8 = bullish
-    ORDER_FLOW_BEARISH = 1.2  # CE_vol/PE_vol > 1.2 = bearish
+    VOLUME_SPIKE_MULTIPLIER = 1.5  # Lower for opening
+    ORDER_FLOW_BULLISH = 0.8
+    ORDER_FLOW_BEARISH = 1.2
     
     # PCR
     PCR_BULLISH = 1.08
@@ -135,37 +134,34 @@ class Config:
     ATR_PERIOD = 14
     ATR_FALLBACK = 30
     ATR_TRAILING_MULTIPLIER = 1.0
-    MIN_CANDLE_SIZE = 8
     
-    # Timing
+    # Timing - UPDATED v2.2
+    BOT_START = time(9, 10)       # Start at 9:10 for yesterday OI
     MARKET_OPEN = time(9, 15)
     MARKET_CLOSE = time(15, 30)
-    AVOID_OPEN_START = time(9, 15)
-    AVOID_OPEN_END = time(9, 45)
+    TRADING_START = time(9, 20)   # Start trading at 9:20
+    OPENING_END = time(9, 45)     # Opening period ends
     AVOID_CLOSE_START = time(15, 15)
-    AVOID_CLOSE_END = time(15, 30)
     SUMMARY_TIME = time(15, 0)
     
-    # Intervals
-    SCAN_INTERVAL = 30
+    # Intervals - UPDATED v2.2
+    OPENING_SCAN_INTERVAL = 5     # 5 sec during opening (9:20-9:45)
+    NORMAL_SCAN_INTERVAL = 30     # 30 sec normal hours
+    PREMARKET_SCAN_INTERVAL = 60  # 1 min pre-market (9:10-9:15)
     
     # Memory
     REDIS_TTL_HOURS = 24
-    SIGNAL_COOLDOWN = 300
+    SIGNAL_COOLDOWN = 180  # 3 min cooldown (faster for opening)
     
     # API
     RATE_LIMIT_SEC = 50
     RATE_LIMIT_MIN = 500
     
-    # Endpoints (Verified)
+    # Endpoints
     INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
     QUOTE_URL = "https://api.upstox.com/v2/market-quote/quotes"
-    OHLC_URL = "https://api.upstox.com/v2/market-quote/ohlc"
-    CANDLE_URL = "https://api.upstox.com/v2/historical-candle/intraday"
     OPTION_CHAIN_URL = "https://api.upstox.com/v2/option/chain"
-    
-    # Use 'symbol' parameter (some endpoints need this instead of instrument_key)
-    USE_SYMBOL_PARAM = True
+    CANDLE_URL = "https://api.upstox.com/v2/historical-candle/intraday"
 
 CFG = Config()
 
@@ -176,17 +172,15 @@ class TradeType(Enum):
 
 class TradeStatus(Enum):
     OPEN = "OPEN"
-    CLOSED_TARGET = "CLOSED_TARGET"
     CLOSED_SL = "CLOSED_SL"
     CLOSED_OI_EXIT = "CLOSED_OI_EXIT"
     CLOSED_TRAILING = "CLOSED_TRAILING"
     CLOSED_EOD = "CLOSED_EOD"
 
 class ExitReason(Enum):
-    TARGET_HIT = "Target Hit"
     STOP_LOSS = "Stop Loss"
     OI_REVERSAL = "OI Support Lost"
-    TRAILING_SL = "Trailing SL Hit"
+    TRAILING_SL = "Trailing SL"
     EOD = "End of Day"
     MAX_LOSS = "Max Daily Loss"
 
@@ -197,14 +191,20 @@ class MovementStatus(Enum):
     REVERSAL_SOON = "REVERSAL_SOON"
     UNKNOWN = "UNKNOWN"
 
+class MarketPhase(Enum):
+    PRE_MARKET = "PRE_MARKET"      # 9:10-9:15
+    OPENING = "OPENING"            # 9:15-9:45
+    NORMAL = "NORMAL"              # 9:45-15:15
+    CLOSING = "CLOSING"            # 15:15-15:30
+    CLOSED = "CLOSED"              # After hours
+
 # ==================== DATA CLASSES ====================
 @dataclass
 class DemoAccount:
-    """Virtual trading account with full tracking"""
+    """Virtual trading account"""
     initial_capital: float = CFG.DEMO_CAPITAL
     current_balance: float = CFG.DEMO_CAPITAL
     realized_pnl: float = 0.0
-    unrealized_pnl: float = 0.0
     trades_today: int = 0
     winning_trades: int = 0
     losing_trades: int = 0
@@ -227,8 +227,6 @@ class DemoAccount:
             return False, f"Max trades ({CFG.MAX_TRADES_PER_DAY}) reached"
         if self.realized_pnl <= -CFG.MAX_LOSS_PER_DAY:
             return False, f"Max loss (₹{CFG.MAX_LOSS_PER_DAY}) reached"
-        if self.current_balance <= 0:
-            return False, "No balance"
         return True, "OK"
     
     def update_pnl(self, pnl: float, is_win: bool):
@@ -249,23 +247,18 @@ class DemoAccount:
     def get_summary(self) -> dict:
         wr = (self.winning_trades / self.trades_today * 100) if self.trades_today > 0 else 0
         return {
-            'initial': self.initial_capital,
             'balance': self.current_balance,
             'realized': self.realized_pnl,
-            'unrealized': self.unrealized_pnl,
             'trades': self.trades_today,
             'wins': self.winning_trades,
             'losses': self.losing_trades,
             'win_rate': wr,
-            'profit': self.total_profit,
-            'loss': self.total_loss,
-            'drawdown': self.max_drawdown,
             'return_pct': ((self.current_balance - self.initial_capital) / self.initial_capital) * 100
         }
 
 @dataclass
 class Position:
-    """Open position with tracking"""
+    """Open position"""
     id: str
     trade_type: TradeType
     strike: int
@@ -277,8 +270,6 @@ class Position:
     
     current_price: float = 0.0
     highest_price: float = 0.0
-    lowest_price: float = 999999.0
-    
     stop_loss: float = 0.0
     trailing_sl: float = 0.0
     trailing_active: bool = False
@@ -296,49 +287,24 @@ class Position:
         self.current_price = price
         if price > self.highest_price:
             self.highest_price = price
-        if price < self.lowest_price:
-            self.lowest_price = price
         self.pnl_points = price - self.entry_price
         self.pnl = self.pnl_points * self.units
 
 @dataclass
-class OIData:
-    """OI snapshot with velocity tracking"""
-    timestamp: datetime
-    strike: int
-    ce_oi: int
-    pe_oi: int
-    ce_vol: int
-    pe_vol: int
-    ce_ltp: float
-    pe_ltp: float
-    spot_price: float
-    
-    # Calculated
-    ce_oi_change_5m: float = 0.0
-    pe_oi_change_5m: float = 0.0
-    ce_oi_change_15m: float = 0.0
-    pe_oi_change_15m: float = 0.0
-    ce_velocity: float = 0.0  # % per minute
-    pe_velocity: float = 0.0
-
-@dataclass
 class MarketState:
-    """Complete market state for analysis"""
+    """Complete market state"""
     timestamp: datetime
     spot_price: float
-    futures_price: float
     atm_strike: int
+    phase: MarketPhase
     
-    # OHLC for TWAP
-    spot_open: float = 0.0
-    spot_high: float = 0.0
-    spot_low: float = 0.0
+    # All fetched strikes (30+)
+    all_strikes: Dict[int, dict] = field(default_factory=dict)
     
-    # Strikes data (7 strikes)
-    strikes: Dict[int, dict] = field(default_factory=dict)
+    # Analysis strikes (7)
+    analysis_strikes: Dict[int, dict] = field(default_factory=dict)
     
-    # Totals
+    # Totals (from analysis strikes)
     total_ce_oi: int = 0
     total_pe_oi: int = 0
     total_ce_vol: int = 0
@@ -346,8 +312,8 @@ class MarketState:
     
     # Calculated
     pcr: float = 1.0
-    order_flow_ratio: float = 1.0  # CE_vol / PE_vol
-    twap: float = 0.0  # Time Weighted Average Price
+    order_flow_ratio: float = 1.0
+    twap: float = 0.0
     
     # OI Changes
     ce_oi_change_5m: float = 0.0
@@ -364,12 +330,12 @@ class MarketState:
     divergence_detected: bool = False
     divergence_type: str = ""
     
-    # Candle (minimal)
-    candle_color: str = "NEUTRAL"
-    candle_size: float = 0.0
-    
     # ATR
     atr: float = CFG.ATR_FALLBACK
+    
+    # Yesterday OI (for 9:10-9:15 baseline)
+    yesterday_ce_oi: int = 0
+    yesterday_pe_oi: int = 0
 
 @dataclass
 class Signal:
@@ -384,8 +350,6 @@ class Signal:
     instrument_key: str
     
     oi_data: dict = field(default_factory=dict)
-    market_state: Optional[MarketState] = None
-    
     stop_loss: float = 0.0
     quantity: int = 1
     timestamp: datetime = field(default_factory=lambda: datetime.now(IST))
@@ -405,19 +369,15 @@ class RateLimiter:
             while self.per_min and now - self.per_min[0] > 60.0:
                 self.per_min.popleft()
             if len(self.per_sec) >= CFG.RATE_LIMIT_SEC:
-                wait = 1.0 - (now - self.per_sec[0])
-                if wait > 0:
-                    await asyncio.sleep(wait)
-                    now = time_module.time()
+                await asyncio.sleep(1.0 - (now - self.per_sec[0]))
+                now = time_module.time()
             if len(self.per_min) >= CFG.RATE_LIMIT_MIN:
-                wait = 60.0 - (now - self.per_min[0])
-                if wait > 0:
-                    await asyncio.sleep(wait)
-                    now = time_module.time()
+                await asyncio.sleep(60.0 - (now - self.per_min[0]))
+                now = time_module.time()
             self.per_sec.append(now)
             self.per_min.append(now)
 
-# ==================== MEMORY (Redis/RAM) ====================
+# ==================== MEMORY ====================
 class Memory:
     """24-hour memory for OI tracking"""
     
@@ -427,6 +387,8 @@ class Memory:
         self.ram_ts = {}
         self.startup = datetime.now(IST)
         self.ttl = CFG.REDIS_TTL_HOURS * 3600
+        self.yesterday_oi = {}  # Store yesterday's closing OI
+        self.warmup_done = False
         
         if REDIS_AVAILABLE:
             try:
@@ -436,25 +398,19 @@ class Memory:
             except Exception as e:
                 self.client = None
                 logger.warning(f"⚠️ Redis failed: {e} - using RAM")
-        else:
-            logger.info("💾 Using RAM mode")
     
-    def is_warmed_up(self, minutes: int = 15) -> bool:
+    def is_warmed_up(self) -> bool:
+        """Check if we have enough OI history"""
+        # If we have yesterday's OI, we're ready immediately
+        if self.yesterday_oi:
+            return True
+        # Otherwise wait 5 min
         elapsed = (datetime.now(IST) - self.startup).total_seconds() / 60
-        return elapsed >= minutes
+        return elapsed >= 5
     
     def _key(self, prefix: str, id: str, ts: datetime) -> str:
         slot = ts.replace(second=0, microsecond=0)
-        return f"nifty:v21:{prefix}:{id}:{slot.strftime('%Y%m%d_%H%M')}"
-    
-    def _cleanup(self):
-        if self.client:
-            return
-        now = time_module.time()
-        expired = [k for k, t in self.ram_ts.items() if now - t > self.ttl]
-        for k in expired:
-            del self.ram[k]
-            del self.ram_ts[k]
+        return f"nifty:v22:{prefix}:{id}:{slot.strftime('%Y%m%d_%H%M')}"
     
     def _set(self, key: str, data: str):
         if self.client:
@@ -466,7 +422,6 @@ class Memory:
         else:
             self.ram[key] = data
             self.ram_ts[key] = time_module.time()
-        self._cleanup()
     
     def _get(self, key: str) -> Optional[str]:
         if self.client:
@@ -484,8 +439,17 @@ class Memory:
         past = datetime.now(IST) - timedelta(minutes=mins)
         key = self._key("oi", str(strike), past)
         data_str = self._get(key)
+        
+        # If no recent data, try yesterday's data
+        if not data_str and self.yesterday_oi.get(strike):
+            past_data = self.yesterday_oi[strike]
+            ce_chg = ((current['ce_oi'] - past_data['ce_oi']) / past_data['ce_oi'] * 100) if past_data.get('ce_oi', 0) > 0 else 0
+            pe_chg = ((current['pe_oi'] - past_data['pe_oi']) / past_data['pe_oi'] * 100) if past_data.get('pe_oi', 0) > 0 else 0
+            return ce_chg, pe_chg
+        
         if not data_str:
             return 0.0, 0.0
+        
         try:
             past_data = json.loads(data_str)
             ce_chg = ((current['ce_oi'] - past_data['ce_oi']) / past_data['ce_oi'] * 100) if past_data.get('ce_oi', 0) > 0 else 0
@@ -502,8 +466,10 @@ class Memory:
         past = datetime.now(IST) - timedelta(minutes=mins)
         key = self._key("total", "all", past)
         data_str = self._get(key)
+        
         if not data_str:
             return 0.0, 0.0
+        
         try:
             past_data = json.loads(data_str)
             ce_chg = ((ce - past_data['ce']) / past_data['ce'] * 100) if past_data.get('ce', 0) > 0 else 0
@@ -512,55 +478,16 @@ class Memory:
         except:
             return 0.0, 0.0
     
-    def save_position_oi(self, pos_id: str, data: dict):
-        key = f"nifty:v21:pos:{pos_id}"
-        self._set(key, json.dumps(data))
-    
-    def get_position_oi(self, pos_id: str) -> Optional[dict]:
-        key = f"nifty:v21:pos:{pos_id}"
-        data_str = self._get(key)
-        return json.loads(data_str) if data_str else None
-    
-    def save_spot_ohlc(self, open_p: float, high: float, low: float, close: float):
-        """Save spot OHLC for TWAP calculation"""
-        key = f"nifty:v21:ohlc:{datetime.now(IST).strftime('%Y%m%d')}"
-        data = {'open': open_p, 'high': high, 'low': low, 'close': close}
-        self._set(key, json.dumps(data))
-    
-    def get_spot_ohlc(self) -> dict:
-        key = f"nifty:v21:ohlc:{datetime.now(IST).strftime('%Y%m%d')}"
-        data_str = self._get(key)
-        return json.loads(data_str) if data_str else {}
-
-# ==================== EXPIRY CALCULATOR ====================
-def get_weekly_expiry() -> datetime:
-    now = datetime.now(IST)
-    days = (1 - now.weekday()) % 7  # Tuesday = 1
-    if days == 0 and now.time() > time(15, 30):
-        days = 7
-    return now + timedelta(days=days)
-
-def get_monthly_expiry() -> datetime:
-    now = datetime.now(IST)
-    year, month = now.year, now.month
-    if month == 12:
-        next_m = datetime(year + 1, 1, 1, tzinfo=IST)
-    else:
-        next_m = datetime(year, month + 1, 1, tzinfo=IST)
-    last_day = next_m - timedelta(days=1)
-    while last_day.weekday() != 1:
-        last_day -= timedelta(days=1)
-    if last_day.date() < now.date():
-        month = month + 1 if month < 12 else 1
-        year = year if month > 1 else year + 1
-        if month == 12:
-            next_m = datetime(year + 1, 1, 1, tzinfo=IST)
-        else:
-            next_m = datetime(year, month + 1, 1, tzinfo=IST)
-        last_day = next_m - timedelta(days=1)
-        while last_day.weekday() != 1:
-            last_day -= timedelta(days=1)
-    return last_day
+    def save_yesterday_oi(self, strikes: Dict[int, dict]):
+        """Save current OI as yesterday's baseline (call at 9:10-9:15)"""
+        for strike, data in strikes.items():
+            self.yesterday_oi[strike] = {
+                'ce_oi': data.get('ce_oi', 0),
+                'pe_oi': data.get('pe_oi', 0),
+                'timestamp': datetime.now(IST).isoformat()
+            }
+        logger.info(f"📦 Saved {len(strikes)} strikes as yesterday OI baseline")
+        self.warmup_done = True
 
 # ==================== DATA FEED ====================
 class DataFeed:
@@ -598,19 +525,21 @@ class DataFeed:
             logger.error(f"❌ Instruments load failed: {e}")
     
     async def _find_futures(self):
-        target = get_monthly_expiry().date()
+        from datetime import datetime
+        target_month = datetime.now(IST).month
+        target_year = datetime.now(IST).year
+        
         for key, inst in self.instruments.items():
             if (inst.get('segment') == 'NSE_FO' and 
                 inst.get('instrument_type') == 'FUT' and 
                 inst.get('name') == 'NIFTY'):
                 exp = inst.get('expiry', 0)
                 if exp:
-                    exp_date = datetime.fromtimestamp(exp / 1000, tz=IST).date()
-                    if exp_date == target:
+                    exp_date = datetime.fromtimestamp(exp / 1000, tz=IST)
+                    if exp_date.month == target_month or (target_month == 12 and exp_date.month == 1):
                         self.futures_key = key
                         logger.info(f"✅ Futures: {inst.get('trading_symbol')}")
                         return
-        logger.warning("⚠️ Futures not found")
     
     async def _fetch(self, url: str, session: aiohttp.ClientSession) -> Optional[dict]:
         for attempt in range(3):
@@ -619,110 +548,72 @@ class DataFeed:
                 async with session.get(url, headers=self.headers, timeout=15) as resp:
                     if resp.status == 200:
                         return await resp.json()
-                    elif resp.status == 429:
-                        wait = 2 ** (attempt + 1)
-                        logger.warning(f"⏳ Rate limited, wait {wait}s")
-                        await asyncio.sleep(wait)
                     elif resp.status == 401:
-                        logger.error(f"❌ HTTP 401: Token expired or invalid!")
-                        text = await resp.text()
-                        logger.error(f"   Response: {text[:200]}")
+                        logger.error("❌ Token expired!")
                         return None
+                    elif resp.status == 429:
+                        await asyncio.sleep(2 ** attempt)
                     else:
-                        text = await resp.text()
-                        logger.warning(f"⚠️ HTTP {resp.status}: {text[:200]}")
-                        await asyncio.sleep(2)
+                        logger.warning(f"⚠️ HTTP {resp.status}")
+                        await asyncio.sleep(1)
             except asyncio.TimeoutError:
-                logger.warning(f"⏱️ Timeout {attempt + 1}/3")
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
             except Exception as e:
-                logger.warning(f"❌ Fetch error: {e}")
-                await asyncio.sleep(2)
+                logger.warning(f"❌ Fetch: {e}")
+                await asyncio.sleep(1)
         return None
     
     async def get_spot_quote(self) -> dict:
-        """Get NIFTY Spot LTP + OHLC"""
+        """Get NIFTY Spot LTP"""
         async with aiohttp.ClientSession() as session:
-            # Use 'symbol' parameter for quotes API
             key = urllib.parse.quote(CFG.SPOT_KEY)
             url = f"{CFG.QUOTE_URL}?symbol={key}"
-            logger.info(f"🔍 Fetching spot from: {url[:80]}...")
-            
             data = await self._fetch(url, session)
             
-            if data:
-                logger.debug(f"📥 Response status: {data.get('status')}")
+            if data and data.get('status') == 'success':
+                data_dict = data.get('data', {})
                 
-                if data.get('status') == 'success':
-                    data_dict = data.get('data', {})
-                    
-                    # Try multiple key formats (Upstox uses different formats)
-                    possible_keys = [
-                        CFG.SPOT_KEY,                    # NSE_INDEX|Nifty 50
-                        'NSE_INDEX:Nifty 50',            # Colon format
-                        'NSE_INDEX|NIFTY 50',            # Uppercase
-                        'NSE_INDEX:NIFTY 50',            # Uppercase with colon
-                    ]
-                    
-                    quote = None
-                    for k in possible_keys:
-                        if k in data_dict:
-                            quote = data_dict[k]
-                            logger.info(f"✅ Found spot with key: {k}")
-                            break
-                    
-                    # If still not found, try first key
-                    if not quote and data_dict:
-                        first_key = list(data_dict.keys())[0]
-                        quote = data_dict[first_key]
-                        logger.info(f"✅ Using first key: {first_key}")
-                    
-                    if quote:
+                # Try multiple key formats
+                for k in [CFG.SPOT_KEY, 'NSE_INDEX:Nifty 50', 'NSE_INDEX|NIFTY 50']:
+                    if k in data_dict:
+                        quote = data_dict[k]
                         ltp = quote.get('last_price', 0)
                         ohlc = quote.get('ohlc', {})
                         
-                        logger.info(f"✅ Spot LTP: ₹{ltp}")
-                        
-                        # Track day OHLC for TWAP
                         if ltp > 0:
                             if self.day_open == 0:
                                 self.day_open = ohlc.get('open', ltp)
-                            if ltp > self.day_high:
-                                self.day_high = ltp
-                            if ltp < self.day_low:
-                                self.day_low = ltp
+                            self.day_high = max(self.day_high, ltp)
+                            self.day_low = min(self.day_low, ltp)
                         
                         return {
                             'ltp': ltp,
                             'open': ohlc.get('open', 0),
                             'high': ohlc.get('high', 0),
-                            'low': ohlc.get('low', 0),
-                            'close': ohlc.get('close', 0)
+                            'low': ohlc.get('low', 0)
                         }
-                    else:
-                        logger.warning(f"⚠️ No quote data. Available keys: {list(data_dict.keys())[:3]}")
-                else:
-                    logger.warning(f"⚠️ API returned: {data.get('status')} - {data.get('message', 'No message')}")
-            else:
-                logger.warning("⚠️ No response from spot API")
                 
+                # Fallback: use first key
+                if data_dict:
+                    first_key = list(data_dict.keys())[0]
+                    quote = data_dict[first_key]
+                    return {'ltp': quote.get('last_price', 0), 'open': 0, 'high': 0, 'low': 0}
+        
         return {'ltp': 0, 'open': 0, 'high': 0, 'low': 0, 'close': 0}
     
-    async def get_futures_candles(self, limit: int = 100) -> List:
-        """Get futures candles for ATR calculation"""
-        if not self.futures_key:
-            return []
-        async with aiohttp.ClientSession() as session:
-            key = urllib.parse.quote(self.futures_key)
-            url = f"{CFG.CANDLE_URL}/{key}/1minute"
-            data = await self._fetch(url, session)
-            if data and data.get('status') == 'success':
-                candles = data.get('data', {}).get('candles', [])
-                return candles[:limit]
-        return []
+    def get_weekly_expiry(self) -> str:
+        """Get current week's expiry date"""
+        now = datetime.now(IST)
+        days_ahead = 1 - now.weekday()  # Tuesday = 1
+        if days_ahead < 0:
+            days_ahead += 7
+        if days_ahead == 0 and now.time() > time(15, 30):
+            days_ahead = 7
+        expiry = now + timedelta(days=days_ahead)
+        return expiry.strftime('%Y-%m-%d')
     
     async def get_option_chain(self, expiry: str) -> List[dict]:
-        """Get option chain for all strikes"""
+        """Get full option chain"""
         async with aiohttp.ClientSession() as session:
             key = urllib.parse.quote(CFG.SPOT_KEY)
             url = f"{CFG.OPTION_CHAIN_URL}?instrument_key={key}&expiry_date={expiry}"
@@ -731,34 +622,71 @@ class DataFeed:
                 return data.get('data', [])
         return []
     
-    async def get_full_market_state(self, memory: Memory) -> MarketState:
-        """Get complete market state for analysis"""
-        now = datetime.now(IST)
+    async def get_candles(self, limit: int = 50) -> List:
+        """Get futures candles for ATR"""
+        if not self.futures_key:
+            return []
+        async with aiohttp.ClientSession() as session:
+            key = urllib.parse.quote(self.futures_key)
+            url = f"{CFG.CANDLE_URL}/{key}/1minute"
+            data = await self._fetch(url, session)
+            if data and data.get('status') == 'success':
+                return data.get('data', {}).get('candles', [])[:limit]
+        return []
+    
+    def get_market_phase(self) -> MarketPhase:
+        """Get current market phase"""
+        now = datetime.now(IST).time()
         
-        # 1. Spot Quote (LTP + OHLC)
+        if now < CFG.MARKET_OPEN:
+            if now >= CFG.BOT_START:
+                return MarketPhase.PRE_MARKET
+            return MarketPhase.CLOSED
+        elif now < CFG.OPENING_END:
+            return MarketPhase.OPENING
+        elif now < CFG.AVOID_CLOSE_START:
+            return MarketPhase.NORMAL
+        elif now <= CFG.MARKET_CLOSE:
+            return MarketPhase.CLOSING
+        else:
+            return MarketPhase.CLOSED
+    
+    async def get_market_state(self, memory: Memory) -> MarketState:
+        """Get complete market state with 30 strikes"""
+        now = datetime.now(IST)
+        phase = self.get_market_phase()
+        
+        # Get spot
         spot = await self.get_spot_quote()
         spot_ltp = spot['ltp']
         
         if spot_ltp == 0:
             logger.warning("⚠️ Spot price unavailable")
-            return MarketState(timestamp=now, spot_price=0, futures_price=0, atm_strike=0)
+            return MarketState(timestamp=now, spot_price=0, atm_strike=0, phase=phase)
         
-        # 2. Calculate ATM
+        logger.info(f"✅ Spot: ₹{spot_ltp:.2f}")
+        
+        # ATM
         atm = round(spot_ltp / CFG.STRIKE_GAP) * CFG.STRIKE_GAP
         
-        # 3. Futures candles for ATR
-        candles = await self.get_futures_candles(50)
-        futures_price = candles[0][4] if candles else spot_ltp
-        
-        # 4. Option Chain
-        expiry = get_weekly_expiry().strftime('%Y-%m-%d')
+        # Get option chain
+        expiry = self.get_weekly_expiry()
         chain = await self.get_option_chain(expiry)
         
-        # 5. Process strikes (7 strikes: ATM ± 3)
-        min_strike = atm - (CFG.ANALYSIS_STRIKES * CFG.STRIKE_GAP)
-        max_strike = atm + (CFG.ANALYSIS_STRIKES * CFG.STRIKE_GAP)
+        if not chain:
+            logger.warning("⚠️ Option chain unavailable")
+            return MarketState(timestamp=now, spot_price=spot_ltp, atm_strike=atm, phase=phase)
         
-        strikes = {}
+        # Process ALL strikes (30+)
+        min_fetch = atm - (CFG.FETCH_STRIKES * CFG.STRIKE_GAP)
+        max_fetch = atm + (CFG.FETCH_STRIKES * CFG.STRIKE_GAP)
+        
+        # Analysis range (7 strikes)
+        min_analysis = atm - (CFG.ANALYSIS_STRIKES * CFG.STRIKE_GAP)
+        max_analysis = atm + (CFG.ANALYSIS_STRIKES * CFG.STRIKE_GAP)
+        
+        all_strikes = {}
+        analysis_strikes = {}
         total_ce_oi = 0
         total_pe_oi = 0
         total_ce_vol = 0
@@ -766,71 +694,76 @@ class DataFeed:
         
         for opt in chain:
             strike = opt.get('strike_price', 0)
-            if min_strike <= strike <= max_strike:
-                ce_data = opt.get('call_options', {}).get('market_data', {})
-                pe_data = opt.get('put_options', {}).get('market_data', {})
-                
-                strikes[strike] = {
-                    'ce_oi': ce_data.get('oi', 0),
-                    'pe_oi': pe_data.get('oi', 0),
-                    'ce_vol': ce_data.get('volume', 0),
-                    'pe_vol': pe_data.get('volume', 0),
-                    'ce_ltp': ce_data.get('ltp', 0),
-                    'pe_ltp': pe_data.get('ltp', 0),
-                    'ce_key': opt.get('call_options', {}).get('instrument_key', ''),
-                    'pe_key': opt.get('put_options', {}).get('instrument_key', ''),
-                    'ce_prev_oi': ce_data.get('prev_oi', 0),
-                    'pe_prev_oi': pe_data.get('prev_oi', 0)
-                }
-                
-                total_ce_oi += ce_data.get('oi', 0)
-                total_pe_oi += pe_data.get('oi', 0)
-                total_ce_vol += ce_data.get('volume', 0)
-                total_pe_vol += pe_data.get('volume', 0)
-                
-                # Save OI snapshot
-                memory.save_oi(strike, {
-                    'ce_oi': ce_data.get('oi', 0),
-                    'pe_oi': pe_data.get('oi', 0),
-                    'ce_vol': ce_data.get('volume', 0),
-                    'pe_vol': pe_data.get('volume', 0),
-                    'ts': now.isoformat()
-                })
+            
+            # Skip if outside fetch range
+            if strike < min_fetch or strike > max_fetch:
+                continue
+            
+            ce_data = opt.get('call_options', {}).get('market_data', {})
+            pe_data = opt.get('put_options', {}).get('market_data', {})
+            
+            strike_info = {
+                'ce_oi': ce_data.get('oi', 0),
+                'pe_oi': pe_data.get('oi', 0),
+                'ce_vol': ce_data.get('volume', 0),
+                'pe_vol': pe_data.get('volume', 0),
+                'ce_ltp': ce_data.get('ltp', 0),
+                'pe_ltp': pe_data.get('ltp', 0),
+                'ce_key': opt.get('call_options', {}).get('instrument_key', ''),
+                'pe_key': opt.get('put_options', {}).get('instrument_key', '')
+            }
+            
+            all_strikes[strike] = strike_info
+            
+            # Save OI snapshot
+            memory.save_oi(strike, {
+                'ce_oi': strike_info['ce_oi'],
+                'pe_oi': strike_info['pe_oi'],
+                'ts': now.isoformat()
+            })
+            
+            # Analysis strikes
+            if min_analysis <= strike <= max_analysis:
+                analysis_strikes[strike] = strike_info
+                total_ce_oi += strike_info['ce_oi']
+                total_pe_oi += strike_info['pe_oi']
+                total_ce_vol += strike_info['ce_vol']
+                total_pe_vol += strike_info['pe_vol']
+        
+        logger.info(f"📊 Fetched {len(all_strikes)} strikes | Analysis: {len(analysis_strikes)}")
+        
+        # Save baseline during pre-market
+        if phase == MarketPhase.PRE_MARKET and not memory.warmup_done:
+            memory.save_yesterday_oi(all_strikes)
         
         # Save total OI
         memory.save_total_oi(total_ce_oi, total_pe_oi)
         
-        # 6. Calculate indicators
+        # Calculate metrics
         pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 1.0
         order_flow = total_ce_vol / total_pe_vol if total_pe_vol > 0 else 1.0
-        
-        # TWAP (for Index without volume)
         twap = (self.day_open + self.day_high + self.day_low + spot_ltp) / 4 if self.day_open > 0 else spot_ltp
         
-        # ATR
-        atr = self._calc_atr(candles)
-        
-        # Candle info (minimal - 10%)
-        candle_color, candle_size = self._candle_info(candles)
-        
-        # 7. OI Changes
+        # OI Changes
         ce_5m, pe_5m = memory.get_total_oi_change(total_ce_oi, total_pe_oi, 5)
         ce_15m, pe_15m = memory.get_total_oi_change(total_ce_oi, total_pe_oi, 15)
         
-        # 8. OI Velocity (change per minute)
-        ce_velocity = ce_15m / 15 if ce_15m != 0 else 0
-        pe_velocity = pe_15m / 15 if pe_15m != 0 else 0
+        # Velocity
+        ce_vel = ce_15m / 15 if ce_15m != 0 else 0
+        pe_vel = pe_15m / 15 if pe_15m != 0 else 0
         
-        # 9. Create state
+        # ATR
+        candles = await self.get_candles(20)
+        atr = self._calc_atr(candles)
+        
+        # Create state
         state = MarketState(
             timestamp=now,
             spot_price=spot_ltp,
-            futures_price=futures_price,
             atm_strike=atm,
-            spot_open=self.day_open,
-            spot_high=self.day_high,
-            spot_low=self.day_low,
-            strikes=strikes,
+            phase=phase,
+            all_strikes=all_strikes,
+            analysis_strikes=analysis_strikes,
             total_ce_oi=total_ce_oi,
             total_pe_oi=total_pe_oi,
             total_ce_vol=total_ce_vol,
@@ -842,20 +775,18 @@ class DataFeed:
             pe_oi_change_5m=pe_5m,
             ce_oi_change_15m=ce_15m,
             pe_oi_change_15m=pe_15m,
-            ce_velocity=ce_velocity,
-            pe_velocity=pe_velocity,
-            candle_color=candle_color,
-            candle_size=candle_size,
+            ce_velocity=ce_vel,
+            pe_velocity=pe_vel,
             atr=atr
         )
         
-        # 10. Movement Status & Divergence
+        # Analyze movement
         state.movement_status, state.divergence_detected, state.divergence_type = self._analyze_movement(state)
         
         return state
     
     def _calc_atr(self, candles: List, period: int = 14) -> float:
-        if len(candles) < period:
+        if len(candles) < 2:
             return CFG.ATR_FALLBACK
         tr_list = []
         for i in range(1, min(len(candles), period + 1)):
@@ -864,21 +795,7 @@ class DataFeed:
             tr_list.append(tr)
         return max(sum(tr_list) / len(tr_list), 10) if tr_list else CFG.ATR_FALLBACK
     
-    def _candle_info(self, candles: List) -> Tuple[str, float]:
-        if not candles:
-            return "NEUTRAL", 0
-        c = candles[0]
-        size = abs(c[4] - c[1])
-        if c[4] > c[1]:
-            return "GREEN", size
-        elif c[4] < c[1]:
-            return "RED", size
-        return "DOJI", size
-    
     def _analyze_movement(self, state: MarketState) -> Tuple[MovementStatus, bool, str]:
-        """Analyze movement status and detect divergence"""
-        
-        # OI Velocity based movement status
         ce_vel = abs(state.ce_velocity)
         pe_vel = abs(state.pe_velocity)
         
@@ -886,29 +803,21 @@ class DataFeed:
         divergence = False
         div_type = ""
         
-        # Strong velocity = trending
         if ce_vel > CFG.OI_VELOCITY_STRONG or pe_vel > CFG.OI_VELOCITY_STRONG:
             status = MovementStatus.TRENDING
-        # Weak velocity = exhausting
         elif ce_vel < CFG.OI_VELOCITY_WEAK and pe_vel < CFG.OI_VELOCITY_WEAK:
-            if abs(state.ce_oi_change_15m) < 2 and abs(state.pe_oi_change_15m) < 2:
-                status = MovementStatus.SIDEWAYS
-            else:
-                status = MovementStatus.EXHAUSTING
+            status = MovementStatus.SIDEWAYS if abs(state.ce_oi_change_15m) < 2 else MovementStatus.EXHAUSTING
         else:
             status = MovementStatus.EXHAUSTING
         
-        # Divergence Detection
-        # Price up + CE OI building = Bearish divergence
-        price_change = ((state.spot_price - state.spot_open) / state.spot_open * 100) if state.spot_open > 0 else 0
+        # Divergence
+        price_change = ((state.spot_price - state.twap) / state.twap * 100) if state.twap > 0 else 0
         
         if price_change > 0.3 and state.ce_oi_change_15m > 3:
             divergence = True
             div_type = "BEARISH (Price↑ + CE OI↑)"
             status = MovementStatus.REVERSAL_SOON
-        
-        # Price down + PE OI building = Bullish divergence
-        if price_change < -0.3 and state.pe_oi_change_15m > 3:
+        elif price_change < -0.3 and state.pe_oi_change_15m > 3:
             divergence = True
             div_type = "BULLISH (Price↓ + PE OI↑)"
             status = MovementStatus.REVERSAL_SOON
@@ -917,12 +826,11 @@ class DataFeed:
 
 # ==================== SIGNAL GENERATOR ====================
 class SignalGenerator:
-    """Generate signals based on OI + Volume (90%) + Candle (10%)"""
+    """Generate signals - OI/Volume based (90%)"""
     
     def __init__(self, memory: Memory):
         self.memory = memory
         self.last_signal = {}
-        self.volume_history = []
     
     def _can_signal(self, strike: int) -> bool:
         now = datetime.now(IST)
@@ -933,177 +841,178 @@ class SignalGenerator:
         self.last_signal[key] = now
         return True
     
-    def _check_volume_surge(self, total_vol: int) -> Tuple[bool, float]:
-        now = datetime.now(IST)
-        self.volume_history.append({'time': now, 'vol': total_vol})
-        cutoff = now - timedelta(minutes=20)
-        self.volume_history = [v for v in self.volume_history if v['time'] > cutoff]
+    def _find_best_otm_strike(self, state: MarketState, direction: str) -> Optional[Tuple[int, dict]]:
+        """Find best OTM strike within premium range"""
         
-        if len(self.volume_history) < 5:
-            return False, 1.0
+        if direction == "CE":
+            # CE = strikes above ATM
+            candidates = []
+            for strike, data in state.all_strikes.items():
+                if strike > state.atm_strike:  # OTM for CE
+                    premium = data.get('ce_ltp', 0)
+                    if CFG.MIN_PREMIUM <= premium <= CFG.MAX_PREMIUM:
+                        candidates.append((strike, data, premium))
+            
+            # Sort by strike (closest first)
+            candidates.sort(key=lambda x: x[0])
+            
+            if candidates:
+                best = candidates[0]
+                return best[0], best[1]
         
-        past = [v['vol'] for v in self.volume_history[:-1]]
-        avg = sum(past) / len(past) if past else 1
-        mult = total_vol / avg if avg > 0 else 1
-        return mult >= CFG.VOLUME_SPIKE_MULTIPLIER, mult
+        else:  # PE
+            # PE = strikes below ATM
+            candidates = []
+            for strike, data in state.all_strikes.items():
+                if strike < state.atm_strike:  # OTM for PE
+                    premium = data.get('pe_ltp', 0)
+                    if CFG.MIN_PREMIUM <= premium <= CFG.MAX_PREMIUM:
+                        candidates.append((strike, data, premium))
+            
+            # Sort by strike (closest first, descending)
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            
+            if candidates:
+                best = candidates[0]
+                return best[0], best[1]
+        
+        return None
     
     def generate(self, state: MarketState) -> Optional[Signal]:
-        """Main signal generation - 90% OI/Volume based"""
+        """Generate trading signal"""
         
-        if not state.strikes or state.spot_price == 0:
+        if state.spot_price == 0 or not state.analysis_strikes:
             return None
         
         # Check warmup
-        if not self.memory.is_warmed_up(15):
-            elapsed = (datetime.now(IST) - self.memory.startup).total_seconds() / 60
-            logger.info(f"⏳ Warmup: {elapsed:.0f}/15 min")
+        if not self.memory.is_warmed_up():
+            logger.info("⏳ Warming up...")
             return None
         
-        # Volume surge check
-        total_vol = state.total_ce_vol + state.total_pe_vol
-        vol_surge, vol_mult = self._check_volume_surge(total_vol)
+        # Skip during reversal
+        if state.movement_status == MovementStatus.REVERSAL_SOON:
+            logger.info(f"⚠️ Reversal detected: {state.divergence_type}")
+            return None
+        
+        # Adjust thresholds based on phase
+        oi_threshold = CFG.OI_OPENING_THRESHOLD if state.phase == MarketPhase.OPENING else CFG.OI_ENTRY_THRESHOLD
         
         # Log analysis
-        logger.info(f"📊 Spot: ₹{state.spot_price:.2f} | ATM: {state.atm_strike}")
+        logger.info(f"📊 ATM: {state.atm_strike} | Phase: {state.phase.value}")
         logger.info(f"📊 OI 15m: CE={state.ce_oi_change_15m:+.1f}% | PE={state.pe_oi_change_15m:+.1f}%")
-        logger.info(f"📊 Velocity: CE={state.ce_velocity:.2f}%/min | PE={state.pe_velocity:.2f}%/min")
-        logger.info(f"📊 PCR: {state.pcr:.2f} | OrderFlow: {state.order_flow_ratio:.2f} | Vol: {vol_mult:.1f}x")
-        logger.info(f"📊 Movement: {state.movement_status.value} | Divergence: {state.divergence_type if state.divergence_detected else 'None'}")
-        logger.info(f"📊 TWAP: ₹{state.twap:.2f} | Spot vs TWAP: {state.spot_price - state.twap:+.1f}")
+        logger.info(f"📊 Velocity: CE={state.ce_velocity:.2f}/min | PE={state.pe_velocity:.2f}/min")
+        logger.info(f"📊 PCR: {state.pcr:.2f} | OrderFlow: {state.order_flow_ratio:.2f}")
+        logger.info(f"📊 Movement: {state.movement_status.value}")
         
-        # Don't trade during reversal
-        if state.movement_status == MovementStatus.REVERSAL_SOON:
-            logger.info(f"⚠️ Reversal detected - {state.divergence_type} - Skipping")
-            return None
-        
-        # ========== CE BUY SIGNAL (Bullish) ==========
-        # CE unwinding = Call writers covering = Bullish
-        if state.ce_oi_change_15m < -CFG.OI_ENTRY_THRESHOLD:
+        # ========== CE BUY (Bullish) ==========
+        if state.ce_oi_change_15m < -oi_threshold:
             
-            # OI/Volume checks (90%)
-            oi_checks = {
-                "CE Unwinding 15m": state.ce_oi_change_15m < -CFG.OI_ENTRY_THRESHOLD,
-                "CE Unwinding 5m": state.ce_oi_change_5m < -3,
-                "OI Velocity Strong": abs(state.ce_velocity) > CFG.OI_VELOCITY_WEAK,
-                "Volume Surge": vol_surge,
-                "Order Flow Bullish": state.order_flow_ratio < CFG.ORDER_FLOW_BULLISH,
+            checks = {
+                "CE Unwinding": state.ce_oi_change_15m < -oi_threshold,
+                "CE 5m Down": state.ce_oi_change_5m < -2,
+                "Velocity Strong": abs(state.ce_velocity) > CFG.OI_VELOCITY_WEAK,
+                "OrderFlow Bullish": state.order_flow_ratio < CFG.ORDER_FLOW_BULLISH,
                 "PCR Bullish": state.pcr > CFG.PCR_BULLISH,
                 "Spot > TWAP": state.spot_price > state.twap,
-                "Movement OK": state.movement_status in [MovementStatus.TRENDING, MovementStatus.UNKNOWN]
+                "Trending": state.movement_status in [MovementStatus.TRENDING, MovementStatus.UNKNOWN]
             }
             
-            # Candle check (10%)
-            candle_ok = state.candle_color == 'GREEN'
+            passed = sum(checks.values())
             
-            oi_passed = sum(oi_checks.values())
+            # Opening needs 3 checks, normal needs 4
+            required = 3 if state.phase == MarketPhase.OPENING else 4
             
-            if oi_passed >= 4:  # At least 4 OI/Volume conditions
-                # OTM strike for trading
-                otm_strike = state.atm_strike + (CFG.OTM_STRIKES_AWAY * CFG.STRIKE_GAP)
+            if passed >= required:
+                result = self._find_best_otm_strike(state, "CE")
                 
-                # Check if OTM data available in wider range
-                # First try from existing strikes
-                strike_data = state.strikes.get(otm_strike)
-                
-                # If not in 7 strikes, we need to get it from chain
-                if not strike_data:
-                    # Use ATM+1 as fallback
-                    otm_strike = state.atm_strike + CFG.STRIKE_GAP
-                    strike_data = state.strikes.get(otm_strike)
-                
-                if not strike_data or strike_data.get('ce_ltp', 0) == 0:
-                    logger.warning(f"⚠️ OTM strike {otm_strike} CE not available")
+                if not result:
+                    logger.warning("⚠️ No suitable CE OTM strike found")
                     return None
                 
-                if not self._can_signal(otm_strike):
+                strike, data = result
+                premium = data['ce_ltp']
+                
+                if not self._can_signal(strike):
                     return None
                 
-                confidence = min(60 + (oi_passed * 5) + (5 if candle_ok else 0), 95)
+                # Stop loss based on phase
+                sl_points = CFG.HARD_STOP_LOSS_POINTS if state.phase == MarketPhase.OPENING else CFG.NORMAL_STOP_LOSS_POINTS
                 
-                logger.info(f"🎯 CE BUY SIGNAL! Strike: {otm_strike} | Premium: ₹{strike_data['ce_ltp']:.2f} | Confidence: {confidence}%")
-                logger.info(f"   Checks passed: {oi_passed}/8 OI + {'✓' if candle_ok else '✗'} Candle")
+                confidence = min(60 + (passed * 5), 95)
+                
+                logger.info(f"🎯 CE BUY! Strike: {strike} | Premium: ₹{premium:.2f} | Conf: {confidence}%")
                 
                 return Signal(
                     type=TradeType.CE_BUY,
-                    reason=f"CE Unwinding {state.ce_oi_change_15m:.1f}% | Vel: {state.ce_velocity:.2f}%/min",
+                    reason=f"CE Unwinding {state.ce_oi_change_15m:.1f}%",
                     confidence=confidence,
                     spot_price=state.spot_price,
-                    strike=otm_strike,
+                    strike=strike,
                     option_type='CE',
-                    premium=strike_data['ce_ltp'],
-                    instrument_key=strike_data.get('ce_key', ''),
+                    premium=premium,
+                    instrument_key=data['ce_key'],
                     oi_data={
                         'ce_15m': state.ce_oi_change_15m,
                         'pe_15m': state.pe_oi_change_15m,
-                        'ce_5m': state.ce_oi_change_5m,
-                        'pe_5m': state.pe_oi_change_5m,
                         'ce_vel': state.ce_velocity,
-                        'pe_vel': state.pe_velocity,
-                        'vol_mult': vol_mult
+                        'pe_vel': state.pe_velocity
                     },
-                    market_state=state,
-                    stop_loss=strike_data['ce_ltp'] - CFG.HARD_STOP_LOSS_POINTS
+                    stop_loss=premium - sl_points
                 )
         
-        # ========== PE BUY SIGNAL (Bearish) ==========
-        if state.pe_oi_change_15m < -CFG.OI_ENTRY_THRESHOLD:
+        # ========== PE BUY (Bearish) ==========
+        if state.pe_oi_change_15m < -oi_threshold:
             
-            oi_checks = {
-                "PE Unwinding 15m": state.pe_oi_change_15m < -CFG.OI_ENTRY_THRESHOLD,
-                "PE Unwinding 5m": state.pe_oi_change_5m < -3,
-                "OI Velocity Strong": abs(state.pe_velocity) > CFG.OI_VELOCITY_WEAK,
-                "Volume Surge": vol_surge,
-                "Order Flow Bearish": state.order_flow_ratio > CFG.ORDER_FLOW_BEARISH,
+            checks = {
+                "PE Unwinding": state.pe_oi_change_15m < -oi_threshold,
+                "PE 5m Down": state.pe_oi_change_5m < -2,
+                "Velocity Strong": abs(state.pe_velocity) > CFG.OI_VELOCITY_WEAK,
+                "OrderFlow Bearish": state.order_flow_ratio > CFG.ORDER_FLOW_BEARISH,
                 "PCR Bearish": state.pcr < CFG.PCR_BEARISH,
                 "Spot < TWAP": state.spot_price < state.twap,
-                "Movement OK": state.movement_status in [MovementStatus.TRENDING, MovementStatus.UNKNOWN]
+                "Trending": state.movement_status in [MovementStatus.TRENDING, MovementStatus.UNKNOWN]
             }
             
-            candle_ok = state.candle_color == 'RED'
-            oi_passed = sum(oi_checks.values())
+            passed = sum(checks.values())
+            required = 3 if state.phase == MarketPhase.OPENING else 4
             
-            if oi_passed >= 4:
-                otm_strike = state.atm_strike - (CFG.OTM_STRIKES_AWAY * CFG.STRIKE_GAP)
-                strike_data = state.strikes.get(otm_strike)
+            if passed >= required:
+                result = self._find_best_otm_strike(state, "PE")
                 
-                if not strike_data:
-                    otm_strike = state.atm_strike - CFG.STRIKE_GAP
-                    strike_data = state.strikes.get(otm_strike)
-                
-                if not strike_data or strike_data.get('pe_ltp', 0) == 0:
-                    logger.warning(f"⚠️ OTM strike {otm_strike} PE not available")
+                if not result:
+                    logger.warning("⚠️ No suitable PE OTM strike found")
                     return None
                 
-                if not self._can_signal(otm_strike):
+                strike, data = result
+                premium = data['pe_ltp']
+                
+                if not self._can_signal(strike):
                     return None
                 
-                confidence = min(60 + (oi_passed * 5) + (5 if candle_ok else 0), 95)
+                sl_points = CFG.HARD_STOP_LOSS_POINTS if state.phase == MarketPhase.OPENING else CFG.NORMAL_STOP_LOSS_POINTS
+                confidence = min(60 + (passed * 5), 95)
                 
-                logger.info(f"🎯 PE BUY SIGNAL! Strike: {otm_strike} | Premium: ₹{strike_data['pe_ltp']:.2f} | Confidence: {confidence}%")
+                logger.info(f"🎯 PE BUY! Strike: {strike} | Premium: ₹{premium:.2f} | Conf: {confidence}%")
                 
                 return Signal(
                     type=TradeType.PE_BUY,
-                    reason=f"PE Unwinding {state.pe_oi_change_15m:.1f}% | Vel: {state.pe_velocity:.2f}%/min",
+                    reason=f"PE Unwinding {state.pe_oi_change_15m:.1f}%",
                     confidence=confidence,
                     spot_price=state.spot_price,
-                    strike=otm_strike,
+                    strike=strike,
                     option_type='PE',
-                    premium=strike_data['pe_ltp'],
-                    instrument_key=strike_data.get('pe_key', ''),
+                    premium=premium,
+                    instrument_key=data['pe_key'],
                     oi_data={
                         'ce_15m': state.ce_oi_change_15m,
                         'pe_15m': state.pe_oi_change_15m,
-                        'ce_5m': state.ce_oi_change_5m,
-                        'pe_5m': state.pe_oi_change_5m,
                         'ce_vel': state.ce_velocity,
-                        'pe_vel': state.pe_velocity,
-                        'vol_mult': vol_mult
+                        'pe_vel': state.pe_velocity
                     },
-                    market_state=state,
-                    stop_loss=strike_data['pe_ltp'] - CFG.HARD_STOP_LOSS_POINTS
+                    stop_loss=premium - sl_points
                 )
         
-        logger.info("✋ No valid setup")
+        logger.info("✋ No setup")
         return None
 
 # ==================== POSITION MANAGER ====================
@@ -1131,13 +1040,13 @@ class PositionManager:
             logger.warning(f"❌ Cannot open: {reason}")
             return None
         
-        self.counter += 1
-        pos_id = f"P{datetime.now(IST).strftime('%Y%m%d')}_{self.counter:03d}"
-        
         cost = signal.premium * CFG.LOT_SIZE
         if cost > self.account.current_balance:
-            logger.warning(f"❌ Insufficient balance: need ₹{cost:.2f}, have ₹{self.account.current_balance:.2f}")
+            logger.warning(f"❌ Need ₹{cost:.0f}, have ₹{self.account.current_balance:.0f}")
             return None
+        
+        self.counter += 1
+        pos_id = f"P{datetime.now(IST).strftime('%Y%m%d')}_{self.counter:03d}"
         
         pos = Position(
             id=pos_id,
@@ -1157,10 +1066,7 @@ class PositionManager:
         self.positions[pos_id] = pos
         self.account.trades_today += 1
         
-        # Save entry OI
-        self.memory.save_position_oi(pos_id, signal.oi_data)
-        
-        logger.info(f"✅ OPENED: {pos_id} | {signal.type.value} | Strike: {signal.strike} | Entry: ₹{signal.premium:.2f} | SL: ₹{signal.stop_loss:.2f}")
+        logger.info(f"✅ OPENED: {pos_id} | {signal.type.value} {signal.strike} @ ₹{signal.premium:.2f} | SL: ₹{signal.stop_loss:.2f}")
         
         return pos
     
@@ -1175,14 +1081,6 @@ class PositionManager:
         pos.pnl_points = price - pos.entry_price
         pos.pnl = pos.pnl_points * pos.units
         
-        status_map = {
-            ExitReason.STOP_LOSS: TradeStatus.CLOSED_SL,
-            ExitReason.OI_REVERSAL: TradeStatus.CLOSED_OI_EXIT,
-            ExitReason.TRAILING_SL: TradeStatus.CLOSED_TRAILING,
-            ExitReason.EOD: TradeStatus.CLOSED_EOD
-        }
-        pos.status = status_map.get(reason, TradeStatus.CLOSED_SL)
-        
         is_win = pos.pnl > 0
         self.account.update_pnl(pos.pnl, is_win)
         
@@ -1190,25 +1088,23 @@ class PositionManager:
         self.closed.append(pos)
         
         emoji = "🟢" if is_win else "🔴"
-        logger.info(f"{emoji} CLOSED: {pos_id} | {reason.value} | P&L: ₹{pos.pnl:.2f} ({pos.pnl_points:+.1f} pts)")
+        logger.info(f"{emoji} CLOSED: {pos_id} | {reason.value} | P&L: ₹{pos.pnl:.2f}")
         
         return pos
     
     def update_positions(self, state: MarketState) -> List[Tuple[str, ExitReason]]:
-        """Update all positions and check exits"""
+        """Update all positions"""
         exits = []
         
         for pos_id, pos in list(self.positions.items()):
-            # Get current price from state
-            # Note: Position might be on OTM strike outside 7-strike analysis range
-            # Try to get from state, if not available, skip price update this cycle
-            strike_data = state.strikes.get(pos.strike)
+            # Get current price from all_strikes (includes OTM)
+            strike_data = state.all_strikes.get(pos.strike)
             
             if strike_data:
                 if pos.trade_type == TradeType.CE_BUY:
-                    price = strike_data.get('ce_ltp', pos.current_price)
+                    price = strike_data.get('ce_ltp', 0)
                 else:
-                    price = strike_data.get('pe_ltp', pos.current_price)
+                    price = strike_data.get('pe_ltp', 0)
                 
                 if price > 0:
                     pos.update_price(price)
@@ -1221,81 +1117,50 @@ class PositionManager:
         return exits
     
     def _check_exit(self, pos: Position, state: MarketState) -> Optional[ExitReason]:
-        """Check all exit conditions"""
+        """Check exit conditions"""
         
-        # 1. Hard Stop Loss
+        # Hard SL
         if pos.current_price <= pos.stop_loss:
-            logger.info(f"🛑 SL Hit: {pos.current_price:.2f} <= {pos.stop_loss:.2f}")
             return ExitReason.STOP_LOSS
         
-        # 2. Trailing SL (ATR based)
+        # Trailing SL
         if pos.trailing_active and pos.current_price <= pos.trailing_sl:
-            logger.info(f"🛑 Trailing SL: {pos.current_price:.2f} <= {pos.trailing_sl:.2f}")
             return ExitReason.TRAILING_SL
         
-        # 3. OI-based Smart Exit
+        # OI-based exit
         if self._check_oi_exit(pos, state):
             return ExitReason.OI_REVERSAL
         
-        # 4. Activate/Update Trailing SL if in profit
-        if pos.pnl_points >= 10:  # 10 points profit
+        # Activate trailing
+        if pos.pnl_points >= 8:
             pos.trailing_active = True
-            # ATR-based trailing
             trail = pos.highest_price - (state.atr * CFG.ATR_TRAILING_MULTIPLIER)
             if trail > pos.trailing_sl:
                 pos.trailing_sl = trail
-                logger.info(f"📈 Trailing SL updated: ₹{pos.trailing_sl:.2f}")
         
         return None
     
     def _check_oi_exit(self, pos: Position, state: MarketState) -> bool:
-        """OI-based exit - exit when OI support ends"""
-        
-        entry_oi = self.memory.get_position_oi(pos.id)
-        if not entry_oi:
-            return False
-        
-        # Get 5m OI change for quick exit
+        """OI-based exit"""
         ce_5m = state.ce_oi_change_5m
         pe_5m = state.pe_oi_change_5m
         
         if pos.trade_type == TradeType.CE_BUY:
-            # Exit if CE starts building (resistance) or PE unwinding accelerates (bearish)
             if ce_5m > CFG.OI_EXIT_REVERSAL:
-                logger.info(f"📊 OI Exit: CE building +{ce_5m:.1f}% = Resistance")
+                logger.info(f"📊 OI Exit: CE building +{ce_5m:.1f}%")
                 return True
-            if pe_5m < -CFG.OI_EXIT_REVERSAL and state.pe_velocity < -CFG.OI_VELOCITY_STRONG:
-                logger.info(f"📊 OI Exit: PE unwinding {pe_5m:.1f}% with strong velocity = Bearish")
-                return True
-            # Exit if movement exhausting and we're in profit
             if state.movement_status == MovementStatus.EXHAUSTING and pos.pnl_points > 0:
-                logger.info(f"📊 OI Exit: Movement exhausting, booking profit")
+                logger.info("📊 OI Exit: Movement exhausting")
                 return True
-        
-        else:  # PE_BUY
+        else:
             if pe_5m > CFG.OI_EXIT_REVERSAL:
-                logger.info(f"📊 OI Exit: PE building +{pe_5m:.1f}% = Support")
-                return True
-            if ce_5m < -CFG.OI_EXIT_REVERSAL and state.ce_velocity < -CFG.OI_VELOCITY_STRONG:
-                logger.info(f"📊 OI Exit: CE unwinding {ce_5m:.1f}% = Bullish")
+                logger.info(f"📊 OI Exit: PE building +{pe_5m:.1f}%")
                 return True
             if state.movement_status == MovementStatus.EXHAUSTING and pos.pnl_points > 0:
-                logger.info(f"📊 OI Exit: Movement exhausting, booking profit")
+                logger.info("📊 OI Exit: Movement exhausting")
                 return True
         
         return False
-    
-    def get_positions_log(self) -> str:
-        if not self.positions:
-            return "No open positions"
-        lines = []
-        total = 0
-        for p in self.positions.values():
-            emoji = "🟢" if p.pnl >= 0 else "🔴"
-            lines.append(f"  {p.id}: {p.trade_type.value} {p.strike} | ₹{p.entry_price:.2f}→₹{p.current_price:.2f} | {emoji} ₹{p.pnl:.2f}")
-            total += p.pnl
-        lines.append(f"  Total Unrealized: ₹{total:.2f}")
-        return "\n".join(lines)
 
 # ==================== TELEGRAM ====================
 class Telegram:
@@ -1306,7 +1171,7 @@ class Telegram:
                 self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
                 logger.info("✅ Telegram ready")
             except Exception as e:
-                logger.warning(f"⚠️ Telegram error: {e}")
+                logger.warning(f"⚠️ Telegram: {e}")
     
     async def send(self, msg: str):
         if not self.bot:
@@ -1316,60 +1181,28 @@ class Telegram:
                 self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg),
                 timeout=5
             )
-        except Exception as e:
-            logger.warning(f"⚠️ Telegram send failed: {e}")
+        except:
+            pass
     
     async def send_trade(self, pos: Position, action: str):
-        emoji = "🟢" if pos.trade_type == TradeType.CE_BUY else "🔴"
         if action == "ENTRY":
-            msg = f"""
-{emoji} TRADE ENTRY
-
-{pos.trade_type.value} | Strike: {pos.strike}
-Entry: ₹{pos.entry_price:.2f}
-SL: ₹{pos.stop_loss:.2f}
-Qty: {pos.quantity} lot ({pos.units} units)
-
-⏰ {pos.entry_time.strftime('%I:%M:%S %p')}
-"""
+            msg = f"🎯 ENTRY\n{pos.trade_type.value} {pos.strike}\n₹{pos.entry_price:.2f} | SL: ₹{pos.stop_loss:.2f}"
         else:
-            pnl_emoji = "✅" if pos.pnl >= 0 else "❌"
-            msg = f"""
-{pnl_emoji} TRADE EXIT
-
-{pos.trade_type.value} | Strike: {pos.strike}
-Entry: ₹{pos.entry_price:.2f} → Exit: ₹{pos.exit_price:.2f}
-P&L: ₹{pos.pnl:+.2f} ({pos.pnl_points:+.1f} pts)
-Reason: {pos.exit_reason.value}
-
-⏰ {pos.exit_time.strftime('%I:%M:%S %p')}
-"""
+            emoji = "✅" if pos.pnl >= 0 else "❌"
+            msg = f"{emoji} EXIT\n{pos.trade_type.value} {pos.strike}\n₹{pos.entry_price:.2f}→₹{pos.exit_price:.2f}\nP&L: ₹{pos.pnl:+.2f}"
         await self.send(msg)
     
     async def send_summary(self, account: DemoAccount, closed: List[Position]):
         s = account.get_summary()
-        trades = ""
-        for i, p in enumerate(closed, 1):
-            e = "✅" if p.pnl >= 0 else "❌"
-            trades += f"{i}. {e} {p.trade_type.value} {p.strike}: ₹{p.pnl:+.2f}\n"
-        if not trades:
-            trades = "No trades\n"
-        
-        pnl_e = "🟢" if s['realized'] >= 0 else "🔴"
+        emoji = "🟢" if s['realized'] >= 0 else "🔴"
         msg = f"""
 📊 DAILY SUMMARY
 
-{pnl_e} Day P&L: ₹{s['realized']:+.2f}
+{emoji} P&L: ₹{s['realized']:+.2f}
 Balance: ₹{s['balance']:.2f}
-Return: {s['return_pct']:+.2f}%
+Trades: {s['trades']} | Win: {s['win_rate']:.0f}%
 
-Trades: {s['trades']}
-Wins: {s['wins']} | Losses: {s['losses']}
-Win Rate: {s['win_rate']:.1f}%
-Max DD: ₹{s['drawdown']:.2f}
-
-{trades}
-🤖 NIFTY Strike Master v2.1
+🤖 NIFTY v2.2
 """
         await self.send(msg)
 
@@ -1387,32 +1220,29 @@ class NiftyBot:
         self.scan_count = 0
         self.last_summary = None
     
-    def is_market_hours(self) -> bool:
-        now = datetime.now(IST).time()
-        return CFG.MARKET_OPEN <= now <= CFG.MARKET_CLOSE
-    
-    def is_tradeable(self) -> bool:
-        now = datetime.now(IST).time()
-        if not self.is_market_hours():
-            return False
-        if CFG.AVOID_OPEN_START <= now <= CFG.AVOID_OPEN_END:
-            return False
-        if CFG.AVOID_CLOSE_START <= now <= CFG.AVOID_CLOSE_END:
-            return False
-        return True
+    def get_scan_interval(self, phase: MarketPhase) -> int:
+        """Dynamic scan interval based on phase"""
+        if phase == MarketPhase.PRE_MARKET:
+            return CFG.PREMARKET_SCAN_INTERVAL
+        elif phase == MarketPhase.OPENING:
+            return CFG.OPENING_SCAN_INTERVAL
+        else:
+            return CFG.NORMAL_SCAN_INTERVAL
     
     async def scan(self):
         self.scan_count += 1
-        logger.info(f"\n{'='*70}")
-        logger.info(f"🔍 SCAN #{self.scan_count} | {datetime.now(IST).strftime('%I:%M:%S %p')}")
-        logger.info(f"{'='*70}")
+        now = datetime.now(IST)
         
-        # Get market state
-        state = await self.feed.get_full_market_state(self.memory)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"🔍 SCAN #{self.scan_count} | {now.strftime('%I:%M:%S %p')}")
+        logger.info(f"{'='*60}")
+        
+        # Get state
+        state = await self.feed.get_market_state(self.memory)
         
         if state.spot_price == 0:
-            logger.warning("⏳ No data, skipping...")
-            return
+            logger.warning("⏳ No data")
+            return state.phase
         
         # Update positions
         exits = self.pos_mgr.update_positions(state)
@@ -1425,78 +1255,63 @@ class NiftyBot:
         
         # Log positions
         if self.pos_mgr.positions:
-            logger.info("📍 Open Positions:")
-            logger.info(self.pos_mgr.get_positions_log())
+            for p in self.pos_mgr.positions.values():
+                emoji = "🟢" if p.pnl >= 0 else "🔴"
+                logger.info(f"📍 {p.id}: {p.trade_type.value} {p.strike} | {emoji} ₹{p.pnl:.2f}")
         
-        # Generate signals
-        if self.is_tradeable():
+        # Generate signals (only during trading hours)
+        if state.phase in [MarketPhase.OPENING, MarketPhase.NORMAL]:
             signal = self.signal_gen.generate(state)
             if signal:
                 pos = self.pos_mgr.open_position(signal)
                 if pos:
                     await self.telegram.send_trade(pos, "ENTRY")
-        else:
-            if not self.is_market_hours():
-                logger.info("🌙 Market closed")
-            else:
-                logger.info("⏳ Avoiding volatile period")
+        elif state.phase == MarketPhase.PRE_MARKET:
+            logger.info("📦 Pre-market: Building OI baseline")
         
         # Account status
         s = self.account.get_summary()
-        logger.info(f"💰 Balance: ₹{s['balance']:.2f} | Day P&L: ₹{s['realized']:+.2f} | Trades: {s['trades']}/{CFG.MAX_TRADES_PER_DAY}")
+        logger.info(f"💰 Balance: ₹{s['balance']:.2f} | P&L: ₹{s['realized']:+.2f} | Trades: {s['trades']}/{CFG.MAX_TRADES_PER_DAY}")
+        
+        return state.phase
     
     async def check_summary(self):
         now = datetime.now(IST)
         if now.time() >= CFG.SUMMARY_TIME and self.last_summary != now.date():
             self.last_summary = now.date()
             
-            # Close all positions EOD
+            # Close all positions
             for pos_id in list(self.pos_mgr.positions.keys()):
                 pos = self.pos_mgr.positions[pos_id]
                 self.pos_mgr.close_position(pos_id, pos.current_price, ExitReason.EOD)
             
             await self.telegram.send_summary(self.account, self.pos_mgr.closed)
-            logger.info("📊 Daily summary sent!")
     
     async def run(self):
-        logger.info("="*70)
-        logger.info("🚀 NIFTY50 STRIKE MASTER PRO v2.1")
-        logger.info("   FULLY AUTONOMOUS TRADING SYSTEM")
-        logger.info("="*70)
-        logger.info("")
-        logger.info(f"💰 Demo Capital: ₹{CFG.DEMO_CAPITAL}")
-        logger.info(f"📦 Lot Size: {CFG.LOT_SIZE}")
-        logger.info(f"📊 Analysis: {CFG.ANALYSIS_STRIKES*2+1} strikes | Trade: OTM ({CFG.OTM_STRIKES_AWAY} away)")
-        logger.info(f"🎯 Logic: 90% OI/Volume + 10% Candle")
-        logger.info(f"🛑 SL: {CFG.HARD_STOP_LOSS_POINTS} pts | Trailing: ATR×{CFG.ATR_TRAILING_MULTIPLIER}")
-        logger.info(f"⚡ Exit: OI-based Smart Exit")
-        logger.info("")
+        logger.info("="*60)
+        logger.info("🚀 NIFTY50 STRIKE MASTER PRO v2.2")
+        logger.info("="*60)
+        logger.info(f"💰 Capital: ₹{CFG.DEMO_CAPITAL} | Lot: {CFG.LOT_SIZE}")
+        logger.info(f"📊 Fetch: {CFG.FETCH_STRIKES*2+1} strikes | Analysis: {CFG.ANALYSIS_STRIKES*2+1}")
+        logger.info(f"💵 Premium: ₹{CFG.MIN_PREMIUM}-{CFG.MAX_PREMIUM}")
+        logger.info(f"⏰ Start: {CFG.BOT_START} | Trade: {CFG.TRADING_START}")
+        logger.info(f"⚡ Opening: {CFG.OPENING_SCAN_INTERVAL}s | Normal: {CFG.NORMAL_SCAN_INTERVAL}s")
         
-        # Check token
-        if not UPSTOX_ACCESS_TOKEN or UPSTOX_ACCESS_TOKEN == '':
+        if not UPSTOX_ACCESS_TOKEN:
             logger.error("❌ UPSTOX_ACCESS_TOKEN not set!")
-            logger.error("   Set environment variable and restart")
             return
         
-        logger.info(f"🔑 Token: {UPSTOX_ACCESS_TOKEN[:20]}...")
-        
-        # Initialize
         await self.feed.initialize()
         
-        # Startup message
         startup = f"""
-🚀 NIFTY STRIKE MASTER v2.1 ONLINE
+🚀 NIFTY v2.2 ONLINE
 
-💰 Capital: ₹{CFG.DEMO_CAPITAL}
-📦 Lot: {CFG.LOT_SIZE}
-🎯 Strategy: OI+Volume Based (90%)
-⚡ Exit: OI Support Based
+💰 ₹{CFG.DEMO_CAPITAL} | Lot {CFG.LOT_SIZE}
+📊 31 strikes fetch | 7 analysis
+💵 Premium ₹{CFG.MIN_PREMIUM}-{CFG.MAX_PREMIUM}
+⚡ Opening 5s | Normal 30s
 
-📊 Analysis: 7 strikes
-🎯 Trade: OTM ({CFG.OTM_STRIKES_AWAY} strikes away)
-🛑 SL: {CFG.HARD_STOP_LOSS_POINTS} points
-
-⏰ {datetime.now(IST).strftime('%d-%b %I:%M %p')}
+⏰ {datetime.now(IST).strftime('%I:%M %p')}
 """
         await self.telegram.send(startup)
         
@@ -1504,40 +1319,40 @@ class NiftyBot:
         
         while self.running:
             try:
-                if self.is_market_hours():
-                    await self.scan()
+                now = datetime.now(IST).time()
+                phase = self.feed.get_market_phase()
+                
+                if phase != MarketPhase.CLOSED:
+                    current_phase = await self.scan()
                     await self.check_summary()
-                    await asyncio.sleep(CFG.SCAN_INTERVAL)
+                    interval = self.get_scan_interval(current_phase)
+                    await asyncio.sleep(interval)
                 else:
                     # Reset at day start
-                    now = datetime.now(IST)
-                    if now.time() < CFG.MARKET_OPEN and now.date() != self.last_summary:
+                    if now < CFG.BOT_START:
                         self.account.reset_daily()
                         self.pos_mgr.closed = []
                         self.feed.day_open = 0
                         self.feed.day_high = 0
                         self.feed.day_low = 999999
+                        self.memory.yesterday_oi = {}
+                        self.memory.warmup_done = False
                     
-                    logger.info(f"🌙 Market closed. Next check in 5 min...")
-                    await asyncio.sleep(300)
+                    logger.info("🌙 Market closed")
+                    await asyncio.sleep(60)
                     
             except KeyboardInterrupt:
-                logger.info("\n🛑 Shutdown requested")
                 self.running = False
             except Exception as e:
                 logger.error(f"💥 Error: {e}")
                 import traceback
                 traceback.print_exc()
-                await asyncio.sleep(30)
+                await asyncio.sleep(10)
         
         logger.info("👋 Bot stopped")
 
 # ==================== MAIN ====================
 async def main():
-    logger.info("="*70)
-    logger.info("Starting NIFTY50 Strike Master PRO v2.1")
-    logger.info("="*70)
-    
     bot = NiftyBot()
     await bot.run()
 
