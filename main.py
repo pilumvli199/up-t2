@@ -588,18 +588,28 @@ class RedisBrain:
         key = f"nifty:strike:{strike}:{timestamp.strftime('%Y%m%d_%H%M')}"
         value = json.dumps(data)
         
+        # Only log first save of each minute to avoid spam
+        should_log = not hasattr(self, '_last_save_log') or \
+                     (now - self._last_save_log).total_seconds() >= 55
+        
         if self.client:
             try:
                 self.client.setex(key, MEMORY_TTL_SECONDS, value)
-                logger.info(f"   💾 Saved ATM {strike} @ {timestamp.strftime('%H:%M')} [Redis]")
+                if should_log:
+                    logger.info(f"   💾 Saved {len([k for k in [key] if 'strike' in k])} strikes @ {timestamp.strftime('%H:%M')} [Redis]")
+                    self._last_save_log = now
             except:
                 self.memory[key] = value
                 self.memory_timestamps[key] = time_module.time()
-                logger.info(f"   💾 Saved ATM {strike} @ {timestamp.strftime('%H:%M')} [RAM fallback]")
+                if should_log:
+                    logger.info(f"   💾 Saved strikes @ {timestamp.strftime('%H:%M')} [RAM fallback]")
+                    self._last_save_log = now
         else:
             self.memory[key] = value
             self.memory_timestamps[key] = time_module.time()
-            logger.info(f"   💾 Saved ATM {strike} @ {timestamp.strftime('%H:%M')} [RAM]")
+            if should_log:
+                logger.info(f"   💾 Saved strikes @ {timestamp.strftime('%H:%M')} [RAM]")
+                self._last_save_log = now
         
         self.snapshot_count += 1
         self._cleanup_old_memory()
@@ -620,19 +630,21 @@ class RedisBrain:
             past_data_str = self.memory.get(key)
         
         if not past_data_str:
-            # INFO: Log which key we're looking for (changed from debug to info)
-            logger.info(f"   🔍 ATM {strike} looking for {minutes_ago}m ago: {timestamp.strftime('%H:%M')}")
+            target_time = timestamp.strftime('%H:%M')
+            logger.info(f"   🔍 ATM {strike} looking for {minutes_ago}m ago: {target_time}")
             
-            # Try to find nearby keys (±2 minutes tolerance)
-            for offset in [0, -1, 1, -2, 2]:
+            # Try to find nearby keys (±3 minutes tolerance - increased!)
+            tried_keys = []
+            for offset in [0, -1, 1, -2, 2, -3, 3]:
                 alt_timestamp = timestamp + timedelta(minutes=offset)
                 alt_key = f"nifty:strike:{strike}:{alt_timestamp.strftime('%Y%m%d_%H%M')}"
+                tried_keys.append(alt_timestamp.strftime('%H:%M'))
                 
                 if self.client:
                     try:
                         past_data_str = self.client.get(alt_key)
                         if past_data_str:
-                            logger.info(f"   ✅ Found ATM data @ {alt_timestamp.strftime('%H:%M')} ({offset:+d} min)")
+                            logger.info(f"   ✅ Found @ {alt_timestamp.strftime('%H:%M')} ({offset:+d} min offset)")
                             break
                     except:
                         pass
@@ -640,16 +652,26 @@ class RedisBrain:
                 if not past_data_str:
                     past_data_str = self.memory.get(alt_key)
                     if past_data_str:
-                        logger.info(f"   ✅ Found ATM data in RAM @ {alt_timestamp.strftime('%H:%M')} ({offset:+d} min)")
+                        logger.info(f"   ✅ Found in RAM @ {alt_timestamp.strftime('%H:%M')} ({offset:+d} min)")
                         break
         
         if not past_data_str:
-            # List available keys for debugging
+            # Enhanced debugging
+            logger.info(f"   ❌ Not found. Tried: {', '.join(tried_keys)}")
+            
+            # Show what we actually have
             if not self.client and self.memory:
                 strike_keys = [k for k in self.memory.keys() if f"strike:{strike}:" in k]
                 if strike_keys:
-                    latest = sorted(strike_keys)[-1] if strike_keys else None
-                    logger.info(f"   ❌ No match. Latest saved: {latest[-9:] if latest else 'none'}")
+                    # Extract timestamps from keys and show range
+                    times = sorted([k.split(':')[-1][-4:] for k in strike_keys])
+                    if times:
+                        first_time = f"{times[0][:2]}:{times[0][2:]}"
+                        last_time = f"{times[-1][:2]}:{times[-1][2:]}"
+                        logger.info(f"   📋 Available: {first_time} to {last_time} ({len(times)} snapshots)")
+                else:
+                    logger.info(f"   📋 No data for strike {strike} yet!")
+            
             return 0.0, 0.0, False
         
         try:
