@@ -583,6 +583,7 @@ class RedisBrain:
     
     def save_strike_snapshot(self, strike: int, data: dict):
         now = datetime.now(IST)
+        # Round to nearest minute for consistent keys
         timestamp = now.replace(second=0, microsecond=0)
         key = f"nifty:strike:{strike}:{timestamp.strftime('%Y%m%d_%H%M')}"
         value = json.dumps(data)
@@ -590,12 +591,15 @@ class RedisBrain:
         if self.client:
             try:
                 self.client.setex(key, MEMORY_TTL_SECONDS, value)
+                logger.info(f"   💾 Saved ATM {strike} @ {timestamp.strftime('%H:%M')} [Redis]")
             except:
                 self.memory[key] = value
                 self.memory_timestamps[key] = time_module.time()
+                logger.info(f"   💾 Saved ATM {strike} @ {timestamp.strftime('%H:%M')} [RAM fallback]")
         else:
             self.memory[key] = value
             self.memory_timestamps[key] = time_module.time()
+            logger.info(f"   💾 Saved ATM {strike} @ {timestamp.strftime('%H:%M')} [RAM]")
         
         self.snapshot_count += 1
         self._cleanup_old_memory()
@@ -616,6 +620,36 @@ class RedisBrain:
             past_data_str = self.memory.get(key)
         
         if not past_data_str:
+            # INFO: Log which key we're looking for (changed from debug to info)
+            logger.info(f"   🔍 ATM {strike} looking for {minutes_ago}m ago: {timestamp.strftime('%H:%M')}")
+            
+            # Try to find nearby keys (±2 minutes tolerance)
+            for offset in [0, -1, 1, -2, 2]:
+                alt_timestamp = timestamp + timedelta(minutes=offset)
+                alt_key = f"nifty:strike:{strike}:{alt_timestamp.strftime('%Y%m%d_%H%M')}"
+                
+                if self.client:
+                    try:
+                        past_data_str = self.client.get(alt_key)
+                        if past_data_str:
+                            logger.info(f"   ✅ Found ATM data @ {alt_timestamp.strftime('%H:%M')} ({offset:+d} min)")
+                            break
+                    except:
+                        pass
+                
+                if not past_data_str:
+                    past_data_str = self.memory.get(alt_key)
+                    if past_data_str:
+                        logger.info(f"   ✅ Found ATM data in RAM @ {alt_timestamp.strftime('%H:%M')} ({offset:+d} min)")
+                        break
+        
+        if not past_data_str:
+            # List available keys for debugging
+            if not self.client and self.memory:
+                strike_keys = [k for k in self.memory.keys() if f"strike:{strike}:" in k]
+                if strike_keys:
+                    latest = sorted(strike_keys)[-1] if strike_keys else None
+                    logger.info(f"   ❌ No match. Latest saved: {latest[-9:] if latest else 'none'}")
             return 0.0, 0.0, False
         
         try:
