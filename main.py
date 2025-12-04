@@ -1,38 +1,18 @@
 #!/usr/bin/env python3
 """
-================================================================================
-    NIFTY50 STRIKE MASTER PRO v2.2 - FULLY AUTONOMOUS TRADING SYSTEM
-================================================================================
+NIFTY50 STRIKE MASTER PRO v2.0 - COMPLETE ENHANCED VERSION
+===========================================================
+✅ FIXED: Historical OI data tracking (even after 4+ hours)
+✅ NEW: Complete analysis data in Telegram alerts
+✅ NEW: Better debugging and validation
+✅ NEW: Auto-detect spot price key format
+✅ NEW: Enhanced signal validation
 
-✅ NEW IN v2.2:
-   - 30 strikes fetch (ATM ± 15) for wide coverage
-   - 7 strikes for OI analysis (ATM ± 3)
-   - Deep OTM trading (4-5 strikes away, ₹20-50 premium)
-   - 9:10 AM start with Yesterday OI baseline
-   - 5 sec polling during opening (9:20-9:45)
-   - 30 sec polling normal hours
-   - Max premium cap ₹60 (affordable with ₹5000)
-   - Aggressive opening mode
-
-📊 TRADING LOGIC (90% OI/Volume, 10% Candle):
-   - Entry: OI unwinding + Volume surge + Spot confirmation
-   - Exit: OI support ends (velocity drop/reversal)
-   - Hold: As long as OI supports the move
-
-⚙️ SETTINGS:
-   - Demo Capital: ₹5,000
-   - Lot Size: 75 (NSE Dec 2025)
-   - Fetch: 30 strikes | Analysis: 7 strikes
-   - Trade: Deep OTM (₹20-60 premium max)
-
-Author: Claude AI
-Version: 2.2
-Date: December 2025
-================================================================================
+Version: 2.1 - Professional Grade
+Author: Enhanced by Claude Sonnet 4.5
 """
 
 import os
-import sys
 import asyncio
 import aiohttp
 import urllib.parse
@@ -41,1323 +21,1650 @@ import pytz
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Tuple, Dict, List
+import pandas as pd
+import numpy as np
 from collections import deque
 import time as time_module
 import gzip
-from enum import Enum
+from io import BytesIO
 
-# ==================== LOGGING SETUP (Railway Compatible) ====================
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
-
-logging.basicConfig(
-    format='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
-    level=logging.INFO,
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger("NIFTY-v2.2")
-logger.setLevel(logging.INFO)
-
-# ==================== OPTIONAL DEPENDENCIES ====================
+# Optional dependencies
 try:
     import redis
     REDIS_AVAILABLE = True
-    logger.info("✅ Redis module available")
 except ImportError:
     REDIS_AVAILABLE = False
-    logger.warning("⚠️ Redis not available - using RAM mode")
+    logging.warning("⚠️ Redis not available - using RAM mode")
 
 try:
     from telegram import Bot
     TELEGRAM_AVAILABLE = True
-    logger.info("✅ Telegram module available")
 except ImportError:
     TELEGRAM_AVAILABLE = False
-    logger.warning("⚠️ Telegram not available")
+    logging.warning("⚠️ Telegram not available")
 
-# ==================== TIMEZONE ====================
+# ==================== CONFIGURATION ====================
 IST = pytz.timezone('Asia/Kolkata')
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO  # Changed back to INFO for cleaner logs
+)
+logger = logging.getLogger("NIFTY-Pro-v2")
 
-# ==================== ENVIRONMENT VARIABLES ====================
-UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN', '')
+UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN', 'YOUR_TOKEN_HERE')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
 
-# ==================== CONFIGURATION ====================
-class Config:
-    """All trading parameters in one place"""
-    
-    # Index
-    INDEX_NAME = 'NIFTY 50'
-    SPOT_KEY = 'NSE_INDEX|Nifty 50'
-    STRIKE_GAP = 50
-    LOT_SIZE = 75  # NSE Dec 2025
-    
-    # Demo Account
-    DEMO_CAPITAL = 5000.0
-    
-    # Risk Management
-    MAX_TRADES_PER_DAY = 5
-    MAX_LOSS_PER_DAY = 250.0
-    MAX_OPEN_POSITIONS = 2
-    HARD_STOP_LOSS_POINTS = 3  # Tight SL for opening
-    NORMAL_STOP_LOSS_POINTS = 5  # Normal hours SL
-    
-    # Strike Configuration - UPDATED v2.2
-    FETCH_STRIKES = 15      # ATM ± 15 = 31 strikes for fetching
-    ANALYSIS_STRIKES = 3    # ATM ± 3 = 7 strikes for OI analysis
-    OTM_STRIKES_AWAY = 4    # Trade 4-5 strikes OTM for cheap premium
-    MAX_PREMIUM = 60.0      # Max ₹60 premium (₹60 × 75 = ₹4,500)
-    MIN_PREMIUM = 15.0      # Min ₹15 premium (too cheap = illiquid)
-    
-    # OI Thresholds
-    OI_ENTRY_THRESHOLD = 5.0
-    OI_STRONG_THRESHOLD = 8.0
-    OI_OPENING_THRESHOLD = 3.0  # Lower threshold for opening
-    OI_EXIT_REVERSAL = 3.0
-    OI_VELOCITY_STRONG = 0.5
-    OI_VELOCITY_WEAK = 0.1
-    
-    # Volume
-    VOLUME_SPIKE_MULTIPLIER = 1.5  # Lower for opening
-    ORDER_FLOW_BULLISH = 0.8
-    ORDER_FLOW_BEARISH = 1.2
-    
-    # PCR
-    PCR_BULLISH = 1.08
-    PCR_BEARISH = 0.92
-    
-    # Technical
-    ATR_PERIOD = 14
-    ATR_FALLBACK = 30
-    ATR_TRAILING_MULTIPLIER = 1.0
-    
-    # Timing - UPDATED v2.2
-    BOT_START = time(9, 10)       # Start at 9:10 for yesterday OI
-    MARKET_OPEN = time(9, 15)
-    MARKET_CLOSE = time(15, 30)
-    TRADING_START = time(9, 20)   # Start trading at 9:20
-    OPENING_END = time(9, 45)     # Opening period ends
-    AVOID_CLOSE_START = time(15, 15)
-    SUMMARY_TIME = time(15, 0)
-    
-    # Intervals - UPDATED v2.2
-    OPENING_SCAN_INTERVAL = 5     # 5 sec during opening (9:20-9:45)
-    NORMAL_SCAN_INTERVAL = 30     # 30 sec normal hours
-    PREMARKET_SCAN_INTERVAL = 60  # 1 min pre-market (9:10-9:15)
-    
-    # Memory
-    REDIS_TTL_HOURS = 24
-    SIGNAL_COOLDOWN = 180  # 3 min cooldown (faster for opening)
-    
-    # API
-    RATE_LIMIT_SEC = 50
-    RATE_LIMIT_MIN = 500
-    
-    # Endpoints
-    INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
-    QUOTE_URL = "https://api.upstox.com/v2/market-quote/quotes"
-    OPTION_CHAIN_URL = "https://api.upstox.com/v2/option/chain"
-    CANDLE_URL = "https://api.upstox.com/v2/historical-candle/intraday"
+NIFTY_CONFIG = {
+    'name': 'NIFTY 50',
+    'spot_key': 'NSE_INDEX|Nifty 50',  # Will auto-detect correct format
+    'strike_gap': 50,
+    'lot_size': 25,
+    'atr_fallback': 30,
+    'expiry_day': 1,
+    'expiry_type': 'weekly'
+}
 
-CFG = Config()
+INSTRUMENTS_JSON_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 
-# ==================== ENUMS ====================
-class TradeType(Enum):
-    CE_BUY = "CE_BUY"
-    PE_BUY = "PE_BUY"
+# Alert Settings
+ALERT_ONLY_MODE = True
+SCAN_INTERVAL = 60
+SEND_ANALYSIS_DATA = True  # 🔥 NEW: Send complete analysis data in Telegram
 
-class TradeStatus(Enum):
-    OPEN = "OPEN"
-    CLOSED_SL = "CLOSED_SL"
-    CLOSED_OI_EXIT = "CLOSED_OI_EXIT"
-    CLOSED_TRAILING = "CLOSED_TRAILING"
-    CLOSED_EOD = "CLOSED_EOD"
+# Signal Thresholds (v2.1 - Optimized based on research)
+OI_THRESHOLD_STRONG = 4.0       # 4% = Strong (was 8.0)
+OI_THRESHOLD_MEDIUM = 2.5       # 2.5% = Medium (was 5.0)
+OI_THRESHOLD_WEAK = 1.5         # 1.5% = Weak signal
+ATM_OI_THRESHOLD_STRONG = 5.0   # 5% ATM = Very strong
+ATM_OI_THRESHOLD = 3.0          # 3% ATM = Medium (was 5.0)
+OI_5M_THRESHOLD = 2.0           # 2% in 5m = Significant
+VOL_SPIKE_MULTIPLIER = 2.0
+PCR_BULLISH = 1.3   # Wider range (was 1.08)
+PCR_BEARISH = 0.7   # Wider range (was 0.92)
+MIN_CANDLE_SIZE = 8
+VWAP_BUFFER = 5
 
-class ExitReason(Enum):
-    STOP_LOSS = "Stop Loss"
-    OI_REVERSAL = "OI Support Lost"
-    TRAILING_SL = "Trailing SL"
-    EOD = "End of Day"
-    MAX_LOSS = "Max Daily Loss"
+# Time Restrictions
+AVOID_OPENING = (time(9, 15), time(9, 45))
+AVOID_CLOSING = (time(15, 15), time(15, 30))
 
-class MovementStatus(Enum):
-    TRENDING = "TRENDING"
-    EXHAUSTING = "EXHAUSTING"
-    SIDEWAYS = "SIDEWAYS"
-    REVERSAL_SOON = "REVERSAL_SOON"
-    UNKNOWN = "UNKNOWN"
+# Technical Indicators
+ATR_PERIOD = 14
+ATR_SL_MULTIPLIER = 1.5
+ATR_TARGET_MULTIPLIER = 2.5
 
-class MarketPhase(Enum):
-    PRE_MARKET = "PRE_MARKET"      # 9:10-9:15
-    OPENING = "OPENING"            # 9:15-9:45
-    NORMAL = "NORMAL"              # 9:45-15:15
-    CLOSING = "CLOSING"            # 15:15-15:30
-    CLOSED = "CLOSED"              # After hours
+# Rate Limiting
+RATE_LIMIT_PER_SECOND = 50
+RATE_LIMIT_PER_MINUTE = 500
 
-# ==================== DATA CLASSES ====================
-@dataclass
-class DemoAccount:
-    """Virtual trading account"""
-    initial_capital: float = CFG.DEMO_CAPITAL
-    current_balance: float = CFG.DEMO_CAPITAL
-    realized_pnl: float = 0.0
-    trades_today: int = 0
-    winning_trades: int = 0
-    losing_trades: int = 0
-    total_profit: float = 0.0
-    total_loss: float = 0.0
-    max_drawdown: float = 0.0
-    peak_balance: float = CFG.DEMO_CAPITAL
-    
-    def reset_daily(self):
-        self.trades_today = 0
-        self.winning_trades = 0
-        self.losing_trades = 0
-        self.total_profit = 0.0
-        self.total_loss = 0.0
-        self.realized_pnl = 0.0
-        logger.info("🔄 Daily counters reset")
-    
-    def can_trade(self) -> Tuple[bool, str]:
-        if self.trades_today >= CFG.MAX_TRADES_PER_DAY:
-            return False, f"Max trades ({CFG.MAX_TRADES_PER_DAY}) reached"
-        if self.realized_pnl <= -CFG.MAX_LOSS_PER_DAY:
-            return False, f"Max loss (₹{CFG.MAX_LOSS_PER_DAY}) reached"
-        return True, "OK"
-    
-    def update_pnl(self, pnl: float, is_win: bool):
-        self.realized_pnl += pnl
-        self.current_balance += pnl
-        if is_win:
-            self.winning_trades += 1
-            self.total_profit += pnl
-        else:
-            self.losing_trades += 1
-            self.total_loss += abs(pnl)
-        if self.current_balance > self.peak_balance:
-            self.peak_balance = self.current_balance
-        dd = self.peak_balance - self.current_balance
-        if dd > self.max_drawdown:
-            self.max_drawdown = dd
-    
-    def get_summary(self) -> dict:
-        wr = (self.winning_trades / self.trades_today * 100) if self.trades_today > 0 else 0
-        return {
-            'balance': self.current_balance,
-            'realized': self.realized_pnl,
-            'trades': self.trades_today,
-            'wins': self.winning_trades,
-            'losses': self.losing_trades,
-            'win_rate': wr,
-            'return_pct': ((self.current_balance - self.initial_capital) / self.initial_capital) * 100
-        }
+# Memory & Signals
+SIGNAL_COOLDOWN_SECONDS = 300
+MEMORY_TTL_SECONDS = 7200  # 🔥 Increased to 2 hours
+TELEGRAM_TIMEOUT = 5
+# Hourly Updates (v2.1 NEW)
+HOURLY_UPDATE_ENABLED = True    # Send hourly JSON to Telegram
+HOURLY_UPDATE_INTERVAL = 3600   # 1 hour in seconds
+
 
 @dataclass
-class Position:
-    """Open position"""
-    id: str
-    trade_type: TradeType
-    strike: int
-    instrument_key: str
-    entry_price: float
-    entry_time: datetime
-    quantity: int
-    units: int
-    
-    current_price: float = 0.0
-    highest_price: float = 0.0
-    stop_loss: float = 0.0
-    trailing_sl: float = 0.0
-    trailing_active: bool = False
-    
-    entry_oi_data: dict = field(default_factory=dict)
-    
-    status: TradeStatus = TradeStatus.OPEN
-    exit_price: float = 0.0
-    exit_time: Optional[datetime] = None
-    exit_reason: Optional[ExitReason] = None
-    pnl: float = 0.0
-    pnl_points: float = 0.0
-    
-    def update_price(self, price: float):
-        self.current_price = price
-        if price > self.highest_price:
-            self.highest_price = price
-        self.pnl_points = price - self.entry_price
-        self.pnl = self.pnl_points * self.units
-
-@dataclass
-class MarketState:
-    """Complete market state"""
-    timestamp: datetime
+class AnalysisData:
+    """Complete analysis data for transparency"""
+    # Market Data
     spot_price: float
+    futures_price: float
     atm_strike: int
-    phase: MarketPhase
+    vwap: float
+    atr: float
+    pcr: float
     
-    # All fetched strikes (30+)
-    all_strikes: Dict[int, dict] = field(default_factory=dict)
-    
-    # Analysis strikes (7)
-    analysis_strikes: Dict[int, dict] = field(default_factory=dict)
-    
-    # Totals (from analysis strikes)
-    total_ce_oi: int = 0
-    total_pe_oi: int = 0
-    total_ce_vol: int = 0
-    total_pe_vol: int = 0
-    
-    # Calculated
-    pcr: float = 1.0
-    order_flow_ratio: float = 1.0
-    twap: float = 0.0
+    # OI Data
+    total_ce_oi: int
+    total_pe_oi: int
+    atm_ce_oi: int
+    atm_pe_oi: int
+    atm_ce_vol: int
+    atm_pe_vol: int
     
     # OI Changes
-    ce_oi_change_5m: float = 0.0
-    pe_oi_change_5m: float = 0.0
-    ce_oi_change_15m: float = 0.0
-    pe_oi_change_15m: float = 0.0
+    ce_oi_15m: float
+    pe_oi_15m: float
+    ce_oi_5m: float
+    pe_oi_5m: float
+    atm_ce_change_15m: float
+    atm_pe_change_15m: float
+    atm_ce_change_5m: float
+    atm_pe_change_5m: float
     
-    # Velocity
-    ce_velocity: float = 0.0
-    pe_velocity: float = 0.0
+    # Candle Data
+    candle_color: str
+    candle_size: float
+    open_price: float
+    high_price: float
+    low_price: float
+    close_price: float
+    current_volume: int
     
-    # Movement
-    movement_status: MovementStatus = MovementStatus.UNKNOWN
-    divergence_detected: bool = False
-    divergence_type: str = ""
+    # Technical Indicators
+    vwap_distance: float
+    volume_surge: float
+    has_volume_spike: bool
+    order_flow_imbalance: float
+    max_pain_strike: int
+    max_pain_distance: float
+    gamma_zone: bool
+    multi_tf_confirm: bool
     
-    # ATR
-    atr: float = CFG.ATR_FALLBACK
+    # Momentum
+    bullish_momentum: bool
+    bearish_momentum: bool
     
-    # Yesterday OI (for 9:10-9:15 baseline)
-    yesterday_ce_oi: int = 0
-    yesterday_pe_oi: int = 0
+    # Strike Data (Top 5 strikes)
+    strike_data_summary: Dict[int, dict] = field(default_factory=dict)
+    
+    # Data Quality
+    data_quality: Dict[str, bool] = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
+    
+    timestamp: datetime = field(default_factory=lambda: datetime.now(IST))
 
 @dataclass
 class Signal:
-    """Trading signal"""
-    type: TradeType
+    type: str
     reason: str
     confidence: int
     spot_price: float
+    futures_price: float
     strike: int
-    option_type: str
-    premium: float
-    instrument_key: str
-    
-    oi_data: dict = field(default_factory=dict)
-    stop_loss: float = 0.0
+    target_points: int
+    stop_loss_points: int
+    pcr: float
+    candle_color: str
+    volume_surge: float
+    oi_5m: float
+    oi_15m: float
+    atm_ce_change: float
+    atm_pe_change: float
+    atr: float
+    timestamp: datetime
+    order_flow_imbalance: float = 0.0
+    max_pain_distance: float = 0.0
+    gamma_zone: bool = False
+    multi_tf_confirm: bool = False
+    lot_size: int = 25
     quantity: int = 1
-    timestamp: datetime = field(default_factory=lambda: datetime.now(IST))
+    atm_ce_oi: int = 0
+    atm_pe_oi: int = 0
+    atm_ce_vol: int = 0
+    atm_pe_vol: int = 0
+    analysis: Optional[AnalysisData] = None  # 🔥 NEW: Complete analysis attached
 
-# ==================== RATE LIMITER ====================
+
+class HourlyDataCollector:
+    """Collects and sends hourly market data to Telegram"""
+    def __init__(self):
+        self.last_hourly_update = None
+        self.hourly_data = []
+    
+    def should_send_hourly_update(self) -> bool:
+        """Check if 1 hour has passed since last update"""
+        now = datetime.now(IST)
+        if self.last_hourly_update is None:
+            return True
+        elapsed = (now - self.last_hourly_update).total_seconds()
+        return elapsed >= HOURLY_UPDATE_INTERVAL
+    
+    def collect_hourly_snapshot(self, spot, futures, atm_strike, vwap, atr, pcr,
+                                total_ce, total_pe, ce_15m, pe_15m, atm_ce_oi, atm_pe_oi,
+                                atm_ce_15m, atm_pe_15m, candle_data, volume, india_vix=0) -> dict:
+        """Collect current market snapshot"""
+        now = datetime.now(IST)
+        
+        snapshot = {
+            "timestamp": now.strftime('%Y-%m-%d %H:%M:%S'),
+            "hour": now.strftime('%I:%M %p'),
+            
+            "prices": {
+                "spot": round(spot, 2),
+                "futures": round(futures, 2),
+                "vwap": round(vwap, 2),
+                "vwap_distance": round(abs(futures - vwap), 2)
+            },
+            
+            "candle": {
+                "open": candle_data.get('open', 0),
+                "high": candle_data.get('high', 0),
+                "low": candle_data.get('low', 0),
+                "close": candle_data.get('close', 0),
+                "volume": candle_data.get('volume', 0)
+            },
+            
+            "oi_data": {
+                "total_ce_oi": total_ce,
+                "total_pe_oi": total_pe,
+                "pcr": round(pcr, 2),
+                "ce_change_15m": round(ce_15m, 2),
+                "pe_change_15m": round(pe_15m, 2)
+            },
+            
+            "atm_data": {
+                "strike": atm_strike,
+                "ce_oi": atm_ce_oi,
+                "pe_oi": atm_pe_oi,
+                "ce_change_15m": round(atm_ce_15m, 2),
+                "pe_change_15m": round(atm_pe_15m, 2)
+            },
+            
+            "technical": {
+                "atr": round(atr, 2),
+                "india_vix": round(india_vix, 2) if india_vix else 0
+            }
+        }
+        
+        self.hourly_data.append(snapshot)
+        return snapshot
+    
+    def generate_hourly_json_message(self, snapshot: dict) -> str:
+        """Generate clean JSON for Telegram"""
+        json_str = json.dumps(snapshot, indent=2)
+        
+        message = f"""
+📊 NIFTY50 - Hourly Update
+
+🕐 Time: {snapshot['hour']}
+
+```json
+{json_str}
+```
+
+💡 Quick View:
+━━━━━━━━━━━━━━━━
+💰 Spot: ₹{snapshot['prices']['spot']:.2f}
+📊 PCR: {snapshot['oi_data']['pcr']}
+🎯 ATM: {snapshot['atm_data']['strike']}
+
+📈 OI Changes (15m):
+   CE: {snapshot['oi_data']['ce_change_15m']:+.1f}%
+   PE: {snapshot['oi_data']['pe_change_15m']:+.1f}%
+
+⚡ ATM Changes (15m):
+   CE: {snapshot['atm_data']['ce_change_15m']:+.1f}%
+   PE: {snapshot['atm_data']['pe_change_15m']:+.1f}%
+━━━━━━━━━━━━━━━━
+
+💾 Data saved for backtesting
+"""
+        return message
+
 class RateLimiter:
     def __init__(self):
-        self.per_sec = deque(maxlen=CFG.RATE_LIMIT_SEC)
-        self.per_min = deque(maxlen=CFG.RATE_LIMIT_MIN)
+        self.requests_per_second = deque(maxlen=RATE_LIMIT_PER_SECOND)
+        self.requests_per_minute = deque(maxlen=RATE_LIMIT_PER_MINUTE)
         self.lock = asyncio.Lock()
     
-    async def wait(self):
+    async def wait_if_needed(self):
         async with self.lock:
             now = time_module.time()
-            while self.per_sec and now - self.per_sec[0] > 1.0:
-                self.per_sec.popleft()
-            while self.per_min and now - self.per_min[0] > 60.0:
-                self.per_min.popleft()
-            if len(self.per_sec) >= CFG.RATE_LIMIT_SEC:
-                await asyncio.sleep(1.0 - (now - self.per_sec[0]))
-                now = time_module.time()
-            if len(self.per_min) >= CFG.RATE_LIMIT_MIN:
-                await asyncio.sleep(60.0 - (now - self.per_min[0]))
-                now = time_module.time()
-            self.per_sec.append(now)
-            self.per_min.append(now)
+            while self.requests_per_second and now - self.requests_per_second[0] > 1.0:
+                self.requests_per_second.popleft()
+            while self.requests_per_minute and now - self.requests_per_minute[0] > 60.0:
+                self.requests_per_minute.popleft()
+            if len(self.requests_per_second) >= RATE_LIMIT_PER_SECOND:
+                sleep_time = 1.0 - (now - self.requests_per_second[0])
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+                    now = time_module.time()
+            if len(self.requests_per_minute) >= RATE_LIMIT_PER_MINUTE:
+                sleep_time = 60.0 - (now - self.requests_per_minute[0])
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+                    now = time_module.time()
+            self.requests_per_second.append(now)
+            self.requests_per_minute.append(now)
 
-# ==================== MEMORY ====================
-class Memory:
-    """24-hour memory for OI tracking"""
+rate_limiter = RateLimiter()
+
+def get_next_tuesday_expiry() -> datetime:
+    now = datetime.now(IST)
+    days_until_tuesday = (1 - now.weekday()) % 7
+    if days_until_tuesday == 0:
+        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        if now > market_close:
+            next_tuesday = now + timedelta(days=7)
+        else:
+            next_tuesday = now
+    else:
+        next_tuesday = now + timedelta(days=days_until_tuesday)
+    return next_tuesday
+
+def get_monthly_expiry() -> datetime:
+    now = datetime.now(IST)
+    year = now.year
+    month = now.month
+    if month == 12:
+        next_month = datetime(year + 1, 1, 1, tzinfo=IST)
+    else:
+        next_month = datetime(year, month + 1, 1, tzinfo=IST)
+    last_day = next_month - timedelta(days=1)
+    while last_day.weekday() != 1:
+        last_day -= timedelta(days=1)
+    if last_day.date() < now.date() or (last_day.date() == now.date() and now.time() > time(15, 30)):
+        if month == 12:
+            next_next = datetime(year + 1, 1, 1, tzinfo=IST)
+        else:
+            next_next = datetime(year, month + 1, 1, tzinfo=IST)
+        if next_next.month == 12:
+            next_next_month = datetime(next_next.year + 1, 1, 1, tzinfo=IST)
+        else:
+            next_next_month = datetime(next_next.year, next_next.month + 1, 1, tzinfo=IST)
+        last_day = next_next_month - timedelta(days=1)
+        while last_day.weekday() != 1:
+            last_day -= timedelta(days=1)
+    return last_day
+
+async def fetch_futures_instrument_key() -> Optional[str]:
+    """Download instruments JSON and find correct futures key"""
+    logger.info("📥 Downloading Upstox instruments...")
     
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(INSTRUMENTS_JSON_URL, timeout=30) as resp:
+                if resp.status == 200:
+                    compressed = await resp.read()
+                    decompressed = gzip.decompress(compressed)
+                    instruments = json.loads(decompressed)
+                    logger.info(f"✅ Loaded {len(instruments)} instruments")
+                    
+                    target_expiry = get_monthly_expiry()
+                    target_date = target_expiry.date()
+                    
+                    logger.info(f"🎯 Looking for NIFTY futures expiry: {target_date.strftime('%d-%b-%Y')}")
+                    
+                    for instrument in instruments:
+                        if instrument.get('segment') != 'NSE_FO':
+                            continue
+                        if instrument.get('instrument_type') != 'FUT':
+                            continue
+                        if instrument.get('name') != 'NIFTY':
+                            continue
+                        
+                        expiry_ms = instrument.get('expiry', 0)
+                        if not expiry_ms:
+                            continue
+                        
+                        expiry_dt = datetime.fromtimestamp(expiry_ms / 1000, tz=IST)
+                        expiry_date = expiry_dt.date()
+                        
+                        if expiry_date == target_date:
+                            instrument_key = instrument.get('instrument_key')
+                            trading_symbol = instrument.get('trading_symbol')
+                            logger.info(f"✅ Found: {trading_symbol}")
+                            logger.info(f"   Key: {instrument_key}")
+                            return instrument_key
+                    
+                    logger.error("❌ No matching futures found")
+                    return None
+                else:
+                    logger.error(f"❌ HTTP {resp.status}")
+                    return None
+    except Exception as e:
+        logger.error(f"💥 Error: {e}")
+        return None
+
+def is_tradeable_time() -> bool:
+    now = datetime.now(IST).time()
+    if not (time(9, 15) <= now <= time(15, 30)):
+        return False
+    if AVOID_OPENING[0] <= now <= AVOID_OPENING[1]:
+        return False
+    if AVOID_CLOSING[0] <= now <= AVOID_CLOSING[1]:
+        return False
+    return True
+
+class RedisBrain:
+    """Enhanced Redis with better OI tracking"""
     def __init__(self):
         self.client = None
-        self.ram = {}
-        self.ram_ts = {}
-        self.startup = datetime.now(IST)
-        self.ttl = CFG.REDIS_TTL_HOURS * 3600
-        self.yesterday_oi = {}  # Store yesterday's closing OI
-        self.warmup_done = False
+        self.memory = {}
+        self.memory_timestamps = {}
+        self.startup_time = datetime.now(IST)
+        self.snapshot_count = 0  # Track how many snapshots saved
         
         if REDIS_AVAILABLE:
             try:
                 self.client = redis.from_url(REDIS_URL, decode_responses=True)
                 self.client.ping()
-                logger.info("✅ Redis connected (24h TTL)")
-            except Exception as e:
+                logger.info("✅ Redis connected")
+            except:
                 self.client = None
-                logger.warning(f"⚠️ Redis failed: {e} - using RAM")
+        if not self.client:
+            logger.info("💾 RAM-only mode")
     
-    def is_warmed_up(self) -> bool:
-        """Check if we have enough OI history"""
-        # If we have yesterday's OI, we're ready immediately
-        if self.yesterday_oi:
-            return True
-        # Otherwise wait 5 min
-        elapsed = (datetime.now(IST) - self.startup).total_seconds() / 60
-        return elapsed >= 5
+    def is_warmed_up(self, minutes: int = 15) -> bool:
+        """Check if enough snapshots have been saved"""
+        elapsed = (datetime.now(IST) - self.startup_time).total_seconds() / 60
+        has_enough_time = elapsed >= minutes
+        has_enough_snapshots = self.snapshot_count >= (minutes / (SCAN_INTERVAL / 60))
+        
+        if not has_enough_time:
+            logger.debug(f"⏳ Warmup: {elapsed:.1f}/{minutes} min elapsed")
+        if not has_enough_snapshots:
+            logger.debug(f"⏳ Snapshots: {self.snapshot_count}/{int(minutes / (SCAN_INTERVAL / 60))} saved")
+        
+        return has_enough_time and has_enough_snapshots
     
-    def _key(self, prefix: str, id: str, ts: datetime) -> str:
-        slot = ts.replace(second=0, microsecond=0)
-        return f"nifty:v22:{prefix}:{id}:{slot.strftime('%Y%m%d_%H%M')}"
+    def _cleanup_old_memory(self):
+        """Clean expired memory in RAM mode"""
+        if self.client:
+            return
+        now = time_module.time()
+        expired = [k for k, ts in self.memory_timestamps.items() if now - ts > MEMORY_TTL_SECONDS]
+        if expired:
+            logger.debug(f"🧹 Cleaned {len(expired)} expired memory entries")
+        for key in expired:
+            del self.memory[key]
+            del self.memory_timestamps[key]
     
-    def _set(self, key: str, data: str):
+    def save_strike_snapshot(self, strike: int, data: dict):
+        """Save strike data with timestamp"""
+        now = datetime.now(IST)
+        timestamp = now.replace(second=0, microsecond=0)
+        key = f"nifty:strike:{strike}:{timestamp.strftime('%Y%m%d_%H%M')}"
+        value = json.dumps(data)
+        
         if self.client:
             try:
-                self.client.setex(key, self.ttl, data)
-            except:
-                self.ram[key] = data
-                self.ram_ts[key] = time_module.time()
+                self.client.setex(key, MEMORY_TTL_SECONDS, value)
+                logger.debug(f"💾 Redis saved: {key}")
+            except Exception as e:
+                logger.warning(f"⚠️ Redis save failed: {e}, using RAM")
+                self.memory[key] = value
+                self.memory_timestamps[key] = time_module.time()
         else:
-            self.ram[key] = data
-            self.ram_ts[key] = time_module.time()
+            self.memory[key] = value
+            self.memory_timestamps[key] = time_module.time()
+            logger.debug(f"💾 RAM saved: {key}")
+        
+        self.snapshot_count += 1
+        self._cleanup_old_memory()
     
-    def _get(self, key: str) -> Optional[str]:
+    def get_strike_oi_change(self, strike: int, current_data: dict, minutes_ago: int = 15) -> Tuple[float, float, bool]:
+        """Get OI change with data availability flag"""
+        now = datetime.now(IST) - timedelta(minutes=minutes_ago)
+        timestamp = now.replace(second=0, microsecond=0)
+        key = f"nifty:strike:{strike}:{timestamp.strftime('%Y%m%d_%H%M')}"
+        
+        past_data_str = None
         if self.client:
             try:
-                return self.client.get(key)
+                past_data_str = self.client.get(key)
             except:
-                return self.ram.get(key)
-        return self.ram.get(key)
-    
-    def save_oi(self, strike: int, data: dict):
-        key = self._key("oi", str(strike), datetime.now(IST))
-        self._set(key, json.dumps(data))
-    
-    def get_oi_change(self, strike: int, current: dict, mins: int) -> Tuple[float, float]:
-        past = datetime.now(IST) - timedelta(minutes=mins)
-        key = self._key("oi", str(strike), past)
-        data_str = self._get(key)
+                pass
         
-        # If no recent data, try yesterday's data
-        if not data_str and self.yesterday_oi.get(strike):
-            past_data = self.yesterday_oi[strike]
-            ce_chg = ((current['ce_oi'] - past_data['ce_oi']) / past_data['ce_oi'] * 100) if past_data.get('ce_oi', 0) > 0 else 0
-            pe_chg = ((current['pe_oi'] - past_data['pe_oi']) / past_data['pe_oi'] * 100) if past_data.get('pe_oi', 0) > 0 else 0
-            return ce_chg, pe_chg
+        if not past_data_str:
+            past_data_str = self.memory.get(key)
         
-        if not data_str:
-            return 0.0, 0.0
+        if not past_data_str:
+            logger.debug(f"📊 No historical data for strike {strike} @ {minutes_ago}m (key: {key})")
+            return 0.0, 0.0, False  # Return False to indicate no data
         
         try:
-            past_data = json.loads(data_str)
-            ce_chg = ((current['ce_oi'] - past_data['ce_oi']) / past_data['ce_oi'] * 100) if past_data.get('ce_oi', 0) > 0 else 0
-            pe_chg = ((current['pe_oi'] - past_data['pe_oi']) / past_data['pe_oi'] * 100) if past_data.get('pe_oi', 0) > 0 else 0
-            return ce_chg, pe_chg
-        except:
-            return 0.0, 0.0
+            past = json.loads(past_data_str)
+            ce_chg = ((current_data['ce_oi'] - past['ce_oi']) / past['ce_oi'] * 100 if past['ce_oi'] > 0 else 0)
+            pe_chg = ((current_data['pe_oi'] - past['pe_oi']) / past['pe_oi'] * 100 if past['pe_oi'] > 0 else 0)
+            logger.debug(f"✅ Found historical data for {strike} @ {minutes_ago}m: CE={ce_chg:+.1f}%, PE={pe_chg:+.1f}%")
+            return ce_chg, pe_chg, True
+        except Exception as e:
+            logger.warning(f"⚠️ Error parsing OI data for {strike}: {e}")
+            return 0.0, 0.0, False
     
-    def save_total_oi(self, ce: int, pe: int):
-        key = self._key("total", "all", datetime.now(IST))
-        self._set(key, json.dumps({'ce': ce, 'pe': pe}))
-    
-    def get_total_oi_change(self, ce: int, pe: int, mins: int) -> Tuple[float, float]:
-        past = datetime.now(IST) - timedelta(minutes=mins)
-        key = self._key("total", "all", past)
-        data_str = self._get(key)
+    def save_total_oi_snapshot(self, ce_total: int, pe_total: int):
+        """Save total OI snapshot"""
+        now = datetime.now(IST)
+        slot = now.replace(second=0, microsecond=0)
+        key = f"nifty:total_oi:{slot.strftime('%Y%m%d_%H%M')}"
+        data = json.dumps({"ce": ce_total, "pe": pe_total})
         
-        if not data_str:
-            return 0.0, 0.0
+        if self.client:
+            try:
+                self.client.setex(key, MEMORY_TTL_SECONDS, data)
+            except:
+                self.memory[key] = data
+                self.memory_timestamps[key] = time_module.time()
+        else:
+            self.memory[key] = data
+            self.memory_timestamps[key] = time_module.time()
+    
+    def get_total_oi_change(self, current_ce: int, current_pe: int, minutes_ago: int = 15) -> Tuple[float, float, bool]:
+        """Get total OI change with data availability flag"""
+        now = datetime.now(IST) - timedelta(minutes=minutes_ago)
+        slot = now.replace(second=0, microsecond=0)
+        key = f"nifty:total_oi:{slot.strftime('%Y%m%d_%H%M')}"
+        
+        past_data = None
+        if self.client:
+            try:
+                past_data = self.client.get(key)
+            except:
+                pass
+        
+        if not past_data:
+            past_data = self.memory.get(key)
+        
+        if not past_data:
+            return 0.0, 0.0, False
         
         try:
-            past_data = json.loads(data_str)
-            ce_chg = ((ce - past_data['ce']) / past_data['ce'] * 100) if past_data.get('ce', 0) > 0 else 0
-            pe_chg = ((pe - past_data['pe']) / past_data['pe'] * 100) if past_data.get('pe', 0) > 0 else 0
-            return ce_chg, pe_chg
+            past = json.loads(past_data)
+            ce_chg = ((current_ce - past['ce']) / past['ce'] * 100 if past['ce'] > 0 else 0)
+            pe_chg = ((current_pe - past['pe']) / past['pe'] * 100 if past['pe'] > 0 else 0)
+            return ce_chg, pe_chg, True
         except:
-            return 0.0, 0.0
+            return 0.0, 0.0, False
     
-    def save_yesterday_oi(self, strikes: Dict[int, dict]):
-        """Save current OI as yesterday's baseline (call at 9:10-9:15)"""
-        for strike, data in strikes.items():
-            self.yesterday_oi[strike] = {
-                'ce_oi': data.get('ce_oi', 0),
-                'pe_oi': data.get('pe_oi', 0),
-                'timestamp': datetime.now(IST).isoformat()
-            }
-        logger.info(f"📦 Saved {len(strikes)} strikes as yesterday OI baseline")
-        self.warmup_done = True
+    def get_memory_stats(self) -> Dict:
+        """Get memory statistics for debugging"""
+        return {
+            'snapshot_count': self.snapshot_count,
+            'ram_keys': len(self.memory) if not self.client else 0,
+            'startup_time': self.startup_time.strftime('%H:%M:%S'),
+            'elapsed_minutes': (datetime.now(IST) - self.startup_time).total_seconds() / 60,
+            'warmed_up_15m': self.is_warmed_up(15),
+            'warmed_up_5m': self.is_warmed_up(5)
+        }
 
-# ==================== DATA FEED ====================
-class DataFeed:
-    """Market data from Upstox API"""
-    
-    def __init__(self):
+class NiftyDataFeed:
+    def __init__(self, futures_key: str):
         self.headers = {
             "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
             "Accept": "application/json"
         }
-        self.rate_limiter = RateLimiter()
-        self.instruments = {}
-        self.futures_key = None
-        self.day_open = 0.0
-        self.day_high = 0.0
-        self.day_low = 999999.0
+        self.futures_symbol = futures_key
+        self.detected_spot_key = None  # Will auto-detect
+        logger.info(f"📊 Futures Key: {futures_key}")
     
-    async def initialize(self):
-        logger.info("📥 Loading instruments...")
-        await self._load_instruments()
-        await self._find_futures()
-        logger.info("✅ DataFeed initialized")
-    
-    async def _load_instruments(self):
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(CFG.INSTRUMENTS_URL, timeout=30) as resp:
-                    if resp.status == 200:
-                        data = gzip.decompress(await resp.read())
-                        instruments = json.loads(data)
-                        for inst in instruments:
-                            self.instruments[inst.get('instrument_key', '')] = inst
-                        logger.info(f"✅ Loaded {len(instruments)} instruments")
-        except Exception as e:
-            logger.error(f"❌ Instruments load failed: {e}")
-    
-    async def _find_futures(self):
-        from datetime import datetime
-        target_month = datetime.now(IST).month
-        target_year = datetime.now(IST).year
-        
-        for key, inst in self.instruments.items():
-            if (inst.get('segment') == 'NSE_FO' and 
-                inst.get('instrument_type') == 'FUT' and 
-                inst.get('name') == 'NIFTY'):
-                exp = inst.get('expiry', 0)
-                if exp:
-                    exp_date = datetime.fromtimestamp(exp / 1000, tz=IST)
-                    if exp_date.month == target_month or (target_month == 12 and exp_date.month == 1):
-                        self.futures_key = key
-                        logger.info(f"✅ Futures: {inst.get('trading_symbol')}")
-                        return
-    
-    async def _fetch(self, url: str, session: aiohttp.ClientSession) -> Optional[dict]:
-        for attempt in range(3):
+    async def fetch_with_retry(self, url: str, session: aiohttp.ClientSession, max_retries: int = 3):
+        for attempt in range(max_retries):
             try:
-                await self.rate_limiter.wait()
+                await rate_limiter.wait_if_needed()
                 async with session.get(url, headers=self.headers, timeout=15) as resp:
                     if resp.status == 200:
                         return await resp.json()
-                    elif resp.status == 401:
-                        logger.error("❌ Token expired!")
-                        return None
                     elif resp.status == 429:
-                        await asyncio.sleep(2 ** attempt)
+                        wait_time = 2 ** (attempt + 1)
+                        logger.warning(f"⏳ Rate limited, waiting {wait_time}s")
+                        await asyncio.sleep(wait_time)
+                    elif resp.status == 400:
+                        error_text = await resp.text()
+                        logger.error(f"❌ Status 400: {error_text[:200]}")
+                        return None
                     else:
-                        logger.warning(f"⚠️ HTTP {resp.status}")
-                        await asyncio.sleep(1)
+                        logger.warning(f"⚠️ Status {resp.status}, retry {attempt + 1}/{max_retries}")
+                        await asyncio.sleep(2)
             except asyncio.TimeoutError:
-                await asyncio.sleep(1)
+                logger.warning(f"⏱️ Timeout, retry {attempt + 1}/{max_retries}")
+                await asyncio.sleep(2)
             except Exception as e:
-                logger.warning(f"❌ Fetch: {e}")
-                await asyncio.sleep(1)
+                logger.warning(f"❌ Error: {e}, retry {attempt + 1}/{max_retries}")
+                await asyncio.sleep(2)
         return None
     
-    async def get_spot_quote(self) -> dict:
-        """Get NIFTY Spot LTP"""
+    async def get_market_data(self) -> Tuple[pd.DataFrame, Dict[int, dict], float, float, float]:
+        """Fetch complete market data with auto-detection"""
         async with aiohttp.ClientSession() as session:
-            key = urllib.parse.quote(CFG.SPOT_KEY)
-            url = f"{CFG.QUOTE_URL}?symbol={key}"
-            data = await self._fetch(url, session)
+            spot_price = 0
+            futures_price = 0
+            df = pd.DataFrame()
+            strike_data = {}
+            total_options_volume = 0
             
-            if data and data.get('status') == 'success':
-                data_dict = data.get('data', {})
+            # 1. SPOT PRICE with auto-detection
+            logger.info("🔍 Fetching NIFTY spot...")
+            
+            # Try original key first
+            spot_keys_to_try = [
+                NIFTY_CONFIG['spot_key'],
+                'NSE_INDEX:Nifty 50',  # Alternative format
+                'NSE_INDEX|Nifty%2050'  # URL encoded
+            ]
+            
+            for spot_key in spot_keys_to_try:
+                if self.detected_spot_key:
+                    spot_key = self.detected_spot_key
                 
-                # Try multiple key formats
-                for k in [CFG.SPOT_KEY, 'NSE_INDEX:Nifty 50', 'NSE_INDEX|NIFTY 50']:
-                    if k in data_dict:
-                        quote = data_dict[k]
-                        ltp = quote.get('last_price', 0)
-                        ohlc = quote.get('ohlc', {})
-                        
-                        if ltp > 0:
-                            if self.day_open == 0:
-                                self.day_open = ohlc.get('open', ltp)
-                            self.day_high = max(self.day_high, ltp)
-                            self.day_low = min(self.day_low, ltp)
-                        
-                        return {
-                            'ltp': ltp,
-                            'open': ohlc.get('open', 0),
-                            'high': ohlc.get('high', 0),
-                            'low': ohlc.get('low', 0)
+                enc_key = urllib.parse.quote(spot_key)
+                url = f"https://api.upstox.com/v2/market-quote/quotes?symbol={enc_key}"
+                
+                try:
+                    async with session.get(url, headers=self.headers, timeout=10) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data.get('status') == 'success':
+                                data_dict = data.get('data', {})
+                                
+                                # Try to find the key in response
+                                for key in data_dict.keys():
+                                    if 'nifty' in key.lower() and '50' in key:
+                                        quote = data_dict[key]
+                                        spot_price = quote.get('last_price', 0)
+                                        if spot_price > 0:
+                                            self.detected_spot_key = key
+                                            logger.info(f"✅ NIFTY Spot: ₹{spot_price:.2f} (key: {key})")
+                                            break
+                                
+                                if spot_price > 0:
+                                    break
+                except Exception as e:
+                    logger.debug(f"⚠️ Spot fetch attempt failed: {e}")
+                
+                if spot_price > 0:
+                    break
+            
+            if spot_price == 0:
+                logger.warning("⚠️ Spot price unavailable, will use futures")
+            
+            # 2. FUTURES CANDLES
+            logger.info(f"🔍 Fetching futures: {self.futures_symbol}")
+            enc_futures = urllib.parse.quote(self.futures_symbol)
+            candle_url = f"https://api.upstox.com/v2/historical-candle/intraday/{enc_futures}/1minute"
+            
+            candle_data = await self.fetch_with_retry(candle_url, session)
+            if candle_data and candle_data.get('status') == 'success':
+                candles = candle_data.get('data', {}).get('candles', [])
+                if candles:
+                    candles_to_use = candles[:500]
+                    df = pd.DataFrame(candles_to_use, columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'oi'])
+                    df['ts'] = pd.to_datetime(df['ts']).dt.tz_convert(IST)
+                    df = df.sort_values('ts').set_index('ts')
+                    if not df.empty:
+                        futures_price = df['close'].iloc[-1]
+                        logger.info(f"✅ Futures: {len(df)} candles | ₹{futures_price:.2f}")
+                        if spot_price == 0 and futures_price > 0:
+                            spot_price = futures_price
+                            logger.warning(f"⚠️ Using futures as spot: ₹{spot_price:.2f}")
+            
+            if spot_price == 0:
+                logger.error("❌ Both spot and futures fetch failed")
+                return df, strike_data, 0, 0, 0
+            
+            # 3. OPTION CHAIN
+            logger.info("🔍 Fetching option chain...")
+            expiry = get_next_tuesday_expiry()
+            expiry_str = expiry.strftime('%Y-%m-%d')
+            
+            # Use detected spot key or try alternatives
+            index_key = self.detected_spot_key if self.detected_spot_key else NIFTY_CONFIG['spot_key']
+            enc_index = urllib.parse.quote(index_key)
+            chain_url = f"https://api.upstox.com/v2/option/chain?instrument_key={enc_index}&expiry_date={expiry_str}"
+            
+            strike_gap = NIFTY_CONFIG['strike_gap']
+            atm_strike = round(spot_price / strike_gap) * strike_gap
+            min_strike = atm_strike - (2 * strike_gap)
+            max_strike = atm_strike + (2 * strike_gap)
+            logger.info(f"📊 ATM: {atm_strike} | Range: {min_strike}-{max_strike}")
+            
+            chain_data = await self.fetch_with_retry(chain_url, session)
+            if chain_data and chain_data.get('status') == 'success':
+                for option in chain_data.get('data', []):
+                    strike = option.get('strike_price', 0)
+                    if min_strike <= strike <= max_strike:
+                        call_data = option.get('call_options', {}).get('market_data', {})
+                        put_data = option.get('put_options', {}).get('market_data', {})
+                        strike_data[strike] = {
+                            'ce_oi': call_data.get('oi', 0),
+                            'pe_oi': put_data.get('oi', 0),
+                            'ce_vol': call_data.get('volume', 0),
+                            'pe_vol': put_data.get('volume', 0),
+                            'ce_ltp': call_data.get('ltp', 0),
+                            'pe_ltp': put_data.get('ltp', 0)
                         }
-                
-                # Fallback: use first key
-                if data_dict:
-                    first_key = list(data_dict.keys())[0]
-                    quote = data_dict[first_key]
-                    return {'ltp': quote.get('last_price', 0), 'open': 0, 'high': 0, 'low': 0}
-        
-        return {'ltp': 0, 'open': 0, 'high': 0, 'low': 0, 'close': 0}
-    
-    def get_weekly_expiry(self) -> str:
-        """Get current week's expiry date"""
-        now = datetime.now(IST)
-        days_ahead = 1 - now.weekday()  # Tuesday = 1
-        if days_ahead < 0:
-            days_ahead += 7
-        if days_ahead == 0 and now.time() > time(15, 30):
-            days_ahead = 7
-        expiry = now + timedelta(days=days_ahead)
-        return expiry.strftime('%Y-%m-%d')
-    
-    async def get_option_chain(self, expiry: str) -> List[dict]:
-        """Get full option chain"""
-        async with aiohttp.ClientSession() as session:
-            key = urllib.parse.quote(CFG.SPOT_KEY)
-            url = f"{CFG.OPTION_CHAIN_URL}?instrument_key={key}&expiry_date={expiry}"
-            data = await self._fetch(url, session)
-            if data and data.get('status') == 'success':
-                return data.get('data', [])
-        return []
-    
-    async def get_candles(self, limit: int = 50) -> List:
-        """Get futures candles for ATR"""
-        if not self.futures_key:
-            return []
-        async with aiohttp.ClientSession() as session:
-            key = urllib.parse.quote(self.futures_key)
-            url = f"{CFG.CANDLE_URL}/{key}/1minute"
-            data = await self._fetch(url, session)
-            if data and data.get('status') == 'success':
-                return data.get('data', {}).get('candles', [])[:limit]
-        return []
-    
-    def get_market_phase(self) -> MarketPhase:
-        """Get current market phase"""
-        now = datetime.now(IST).time()
-        
-        if now < CFG.MARKET_OPEN:
-            if now >= CFG.BOT_START:
-                return MarketPhase.PRE_MARKET
-            return MarketPhase.CLOSED
-        elif now < CFG.OPENING_END:
-            return MarketPhase.OPENING
-        elif now < CFG.AVOID_CLOSE_START:
-            return MarketPhase.NORMAL
-        elif now <= CFG.MARKET_CLOSE:
-            return MarketPhase.CLOSING
-        else:
-            return MarketPhase.CLOSED
-    
-    async def get_market_state(self, memory: Memory) -> MarketState:
-        """Get complete market state with 30 strikes"""
-        now = datetime.now(IST)
-        phase = self.get_market_phase()
-        
-        # Get spot
-        spot = await self.get_spot_quote()
-        spot_ltp = spot['ltp']
-        
-        if spot_ltp == 0:
-            logger.warning("⚠️ Spot price unavailable")
-            return MarketState(timestamp=now, spot_price=0, atm_strike=0, phase=phase)
-        
-        logger.info(f"✅ Spot: ₹{spot_ltp:.2f}")
-        
-        # ATM
-        atm = round(spot_ltp / CFG.STRIKE_GAP) * CFG.STRIKE_GAP
-        
-        # Get option chain
-        expiry = self.get_weekly_expiry()
-        chain = await self.get_option_chain(expiry)
-        
-        if not chain:
-            logger.warning("⚠️ Option chain unavailable")
-            return MarketState(timestamp=now, spot_price=spot_ltp, atm_strike=atm, phase=phase)
-        
-        # Process ALL strikes (30+)
-        min_fetch = atm - (CFG.FETCH_STRIKES * CFG.STRIKE_GAP)
-        max_fetch = atm + (CFG.FETCH_STRIKES * CFG.STRIKE_GAP)
-        
-        # Analysis range (7 strikes)
-        min_analysis = atm - (CFG.ANALYSIS_STRIKES * CFG.STRIKE_GAP)
-        max_analysis = atm + (CFG.ANALYSIS_STRIKES * CFG.STRIKE_GAP)
-        
-        all_strikes = {}
-        analysis_strikes = {}
-        total_ce_oi = 0
-        total_pe_oi = 0
-        total_ce_vol = 0
-        total_pe_vol = 0
-        
-        for opt in chain:
-            strike = opt.get('strike_price', 0)
+                        total_options_volume += (call_data.get('volume', 0) + put_data.get('volume', 0))
+                logger.info(f"✅ Collected {len(strike_data)} strikes")
             
-            # Skip if outside fetch range
-            if strike < min_fetch or strike > max_fetch:
-                continue
-            
-            ce_data = opt.get('call_options', {}).get('market_data', {})
-            pe_data = opt.get('put_options', {}).get('market_data', {})
-            
-            strike_info = {
-                'ce_oi': ce_data.get('oi', 0),
-                'pe_oi': pe_data.get('oi', 0),
-                'ce_vol': ce_data.get('volume', 0),
-                'pe_vol': pe_data.get('volume', 0),
-                'ce_ltp': ce_data.get('ltp', 0),
-                'pe_ltp': pe_data.get('ltp', 0),
-                'ce_key': opt.get('call_options', {}).get('instrument_key', ''),
-                'pe_key': opt.get('put_options', {}).get('instrument_key', '')
-            }
-            
-            all_strikes[strike] = strike_info
-            
-            # Save OI snapshot
-            memory.save_oi(strike, {
-                'ce_oi': strike_info['ce_oi'],
-                'pe_oi': strike_info['pe_oi'],
-                'ts': now.isoformat()
-            })
-            
-            # Analysis strikes
-            if min_analysis <= strike <= max_analysis:
-                analysis_strikes[strike] = strike_info
-                total_ce_oi += strike_info['ce_oi']
-                total_pe_oi += strike_info['pe_oi']
-                total_ce_vol += strike_info['ce_vol']
-                total_pe_vol += strike_info['pe_vol']
-        
-        logger.info(f"📊 Fetched {len(all_strikes)} strikes | Analysis: {len(analysis_strikes)}")
-        
-        # Save baseline during pre-market
-        if phase == MarketPhase.PRE_MARKET and not memory.warmup_done:
-            memory.save_yesterday_oi(all_strikes)
-        
-        # Save total OI
-        memory.save_total_oi(total_ce_oi, total_pe_oi)
-        
-        # Calculate metrics
-        pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 1.0
-        order_flow = total_ce_vol / total_pe_vol if total_pe_vol > 0 else 1.0
-        twap = (self.day_open + self.day_high + self.day_low + spot_ltp) / 4 if self.day_open > 0 else spot_ltp
-        
-        # OI Changes
-        ce_5m, pe_5m = memory.get_total_oi_change(total_ce_oi, total_pe_oi, 5)
-        ce_15m, pe_15m = memory.get_total_oi_change(total_ce_oi, total_pe_oi, 15)
-        
-        # Velocity
-        ce_vel = ce_15m / 15 if ce_15m != 0 else 0
-        pe_vel = pe_15m / 15 if pe_15m != 0 else 0
-        
-        # ATR
-        candles = await self.get_candles(20)
-        atr = self._calc_atr(candles)
-        
-        # Create state
-        state = MarketState(
-            timestamp=now,
-            spot_price=spot_ltp,
-            atm_strike=atm,
-            phase=phase,
-            all_strikes=all_strikes,
-            analysis_strikes=analysis_strikes,
-            total_ce_oi=total_ce_oi,
-            total_pe_oi=total_pe_oi,
-            total_ce_vol=total_ce_vol,
-            total_pe_vol=total_pe_vol,
-            pcr=pcr,
-            order_flow_ratio=order_flow,
-            twap=twap,
-            ce_oi_change_5m=ce_5m,
-            pe_oi_change_5m=pe_5m,
-            ce_oi_change_15m=ce_15m,
-            pe_oi_change_15m=pe_15m,
-            ce_velocity=ce_vel,
-            pe_velocity=pe_vel,
-            atr=atr
-        )
-        
-        # Analyze movement
-        state.movement_status, state.divergence_detected, state.divergence_type = self._analyze_movement(state)
-        
-        return state
-    
-    def _calc_atr(self, candles: List, period: int = 14) -> float:
-        if len(candles) < 2:
-            return CFG.ATR_FALLBACK
-        tr_list = []
-        for i in range(1, min(len(candles), period + 1)):
-            h, l, pc = candles[i][2], candles[i][3], candles[i-1][4]
-            tr = max(h - l, abs(h - pc), abs(l - pc))
-            tr_list.append(tr)
-        return max(sum(tr_list) / len(tr_list), 10) if tr_list else CFG.ATR_FALLBACK
-    
-    def _analyze_movement(self, state: MarketState) -> Tuple[MovementStatus, bool, str]:
-        ce_vel = abs(state.ce_velocity)
-        pe_vel = abs(state.pe_velocity)
-        
-        status = MovementStatus.UNKNOWN
-        divergence = False
-        div_type = ""
-        
-        if ce_vel > CFG.OI_VELOCITY_STRONG or pe_vel > CFG.OI_VELOCITY_STRONG:
-            status = MovementStatus.TRENDING
-        elif ce_vel < CFG.OI_VELOCITY_WEAK and pe_vel < CFG.OI_VELOCITY_WEAK:
-            status = MovementStatus.SIDEWAYS if abs(state.ce_oi_change_15m) < 2 else MovementStatus.EXHAUSTING
-        else:
-            status = MovementStatus.EXHAUSTING
-        
-        # Divergence
-        price_change = ((state.spot_price - state.twap) / state.twap * 100) if state.twap > 0 else 0
-        
-        if price_change > 0.3 and state.ce_oi_change_15m > 3:
-            divergence = True
-            div_type = "BEARISH (Price↑ + CE OI↑)"
-            status = MovementStatus.REVERSAL_SOON
-        elif price_change < -0.3 and state.pe_oi_change_15m > 3:
-            divergence = True
-            div_type = "BULLISH (Price↓ + PE OI↑)"
-            status = MovementStatus.REVERSAL_SOON
-        
-        return status, divergence, div_type
+            return df, strike_data, spot_price, futures_price, total_options_volume
 
-# ==================== SIGNAL GENERATOR ====================
-class SignalGenerator:
-    """Generate signals - OI/Volume based (90%)"""
-    
-    def __init__(self, memory: Memory):
-        self.memory = memory
-        self.last_signal = {}
-    
-    def _can_signal(self, strike: int) -> bool:
-        now = datetime.now(IST)
-        key = f"sig_{strike}"
-        if key in self.last_signal:
-            if (now - self.last_signal[key]).total_seconds() < CFG.SIGNAL_COOLDOWN:
-                return False
-        self.last_signal[key] = now
-        return True
-    
-    def _find_best_otm_strike(self, state: MarketState, direction: str) -> Optional[Tuple[int, dict]]:
-        """Find best OTM strike within premium range"""
-        
-        if direction == "CE":
-            # CE = strikes above ATM
-            candidates = []
-            for strike, data in state.all_strikes.items():
-                if strike > state.atm_strike:  # OTM for CE
-                    premium = data.get('ce_ltp', 0)
-                    if CFG.MIN_PREMIUM <= premium <= CFG.MAX_PREMIUM:
-                        candidates.append((strike, data, premium))
-            
-            # Sort by strike (closest first)
-            candidates.sort(key=lambda x: x[0])
-            
-            if candidates:
-                best = candidates[0]
-                return best[0], best[1]
-        
-        else:  # PE
-            # PE = strikes below ATM
-            candidates = []
-            for strike, data in state.all_strikes.items():
-                if strike < state.atm_strike:  # OTM for PE
-                    premium = data.get('pe_ltp', 0)
-                    if CFG.MIN_PREMIUM <= premium <= CFG.MAX_PREMIUM:
-                        candidates.append((strike, data, premium))
-            
-            # Sort by strike (closest first, descending)
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            
-            if candidates:
-                best = candidates[0]
-                return best[0], best[1]
-        
-        return None
-    
-    def generate(self, state: MarketState) -> Optional[Signal]:
-        """Generate trading signal"""
-        
-        if state.spot_price == 0 or not state.analysis_strikes:
-            return None
-        
-        # Check warmup
-        if not self.memory.is_warmed_up():
-            logger.info("⏳ Warming up...")
-            return None
-        
-        # Skip during reversal
-        if state.movement_status == MovementStatus.REVERSAL_SOON:
-            logger.info(f"⚠️ Reversal detected: {state.divergence_type}")
-            return None
-        
-        # Adjust thresholds based on phase
-        oi_threshold = CFG.OI_OPENING_THRESHOLD if state.phase == MarketPhase.OPENING else CFG.OI_ENTRY_THRESHOLD
-        
-        # Log analysis
-        logger.info(f"📊 ATM: {state.atm_strike} | Phase: {state.phase.value}")
-        logger.info(f"📊 OI 15m: CE={state.ce_oi_change_15m:+.1f}% | PE={state.pe_oi_change_15m:+.1f}%")
-        logger.info(f"📊 Velocity: CE={state.ce_velocity:.2f}/min | PE={state.pe_velocity:.2f}/min")
-        logger.info(f"📊 PCR: {state.pcr:.2f} | OrderFlow: {state.order_flow_ratio:.2f}")
-        logger.info(f"📊 Movement: {state.movement_status.value}")
-        
-        # ========== CE BUY (Bullish) ==========
-        if state.ce_oi_change_15m < -oi_threshold:
-            
-            checks = {
-                "CE Unwinding": state.ce_oi_change_15m < -oi_threshold,
-                "CE 5m Down": state.ce_oi_change_5m < -2,
-                "Velocity Strong": abs(state.ce_velocity) > CFG.OI_VELOCITY_WEAK,
-                "OrderFlow Bullish": state.order_flow_ratio < CFG.ORDER_FLOW_BULLISH,
-                "PCR Bullish": state.pcr > CFG.PCR_BULLISH,
-                "Spot > TWAP": state.spot_price > state.twap,
-                "Trending": state.movement_status in [MovementStatus.TRENDING, MovementStatus.UNKNOWN]
-            }
-            
-            passed = sum(checks.values())
-            
-            # Opening needs 3 checks, normal needs 4
-            required = 3 if state.phase == MarketPhase.OPENING else 4
-            
-            if passed >= required:
-                result = self._find_best_otm_strike(state, "CE")
-                
-                if not result:
-                    logger.warning("⚠️ No suitable CE OTM strike found")
-                    return None
-                
-                strike, data = result
-                premium = data['ce_ltp']
-                
-                if not self._can_signal(strike):
-                    return None
-                
-                # Stop loss based on phase
-                sl_points = CFG.HARD_STOP_LOSS_POINTS if state.phase == MarketPhase.OPENING else CFG.NORMAL_STOP_LOSS_POINTS
-                
-                confidence = min(60 + (passed * 5), 95)
-                
-                logger.info(f"🎯 CE BUY! Strike: {strike} | Premium: ₹{premium:.2f} | Conf: {confidence}%")
-                
-                return Signal(
-                    type=TradeType.CE_BUY,
-                    reason=f"CE Unwinding {state.ce_oi_change_15m:.1f}%",
-                    confidence=confidence,
-                    spot_price=state.spot_price,
-                    strike=strike,
-                    option_type='CE',
-                    premium=premium,
-                    instrument_key=data['ce_key'],
-                    oi_data={
-                        'ce_15m': state.ce_oi_change_15m,
-                        'pe_15m': state.pe_oi_change_15m,
-                        'ce_vel': state.ce_velocity,
-                        'pe_vel': state.pe_velocity
-                    },
-                    stop_loss=premium - sl_points
-                )
-        
-        # ========== PE BUY (Bearish) ==========
-        if state.pe_oi_change_15m < -oi_threshold:
-            
-            checks = {
-                "PE Unwinding": state.pe_oi_change_15m < -oi_threshold,
-                "PE 5m Down": state.pe_oi_change_5m < -2,
-                "Velocity Strong": abs(state.pe_velocity) > CFG.OI_VELOCITY_WEAK,
-                "OrderFlow Bearish": state.order_flow_ratio > CFG.ORDER_FLOW_BEARISH,
-                "PCR Bearish": state.pcr < CFG.PCR_BEARISH,
-                "Spot < TWAP": state.spot_price < state.twap,
-                "Trending": state.movement_status in [MovementStatus.TRENDING, MovementStatus.UNKNOWN]
-            }
-            
-            passed = sum(checks.values())
-            required = 3 if state.phase == MarketPhase.OPENING else 4
-            
-            if passed >= required:
-                result = self._find_best_otm_strike(state, "PE")
-                
-                if not result:
-                    logger.warning("⚠️ No suitable PE OTM strike found")
-                    return None
-                
-                strike, data = result
-                premium = data['pe_ltp']
-                
-                if not self._can_signal(strike):
-                    return None
-                
-                sl_points = CFG.HARD_STOP_LOSS_POINTS if state.phase == MarketPhase.OPENING else CFG.NORMAL_STOP_LOSS_POINTS
-                confidence = min(60 + (passed * 5), 95)
-                
-                logger.info(f"🎯 PE BUY! Strike: {strike} | Premium: ₹{premium:.2f} | Conf: {confidence}%")
-                
-                return Signal(
-                    type=TradeType.PE_BUY,
-                    reason=f"PE Unwinding {state.pe_oi_change_15m:.1f}%",
-                    confidence=confidence,
-                    spot_price=state.spot_price,
-                    strike=strike,
-                    option_type='PE',
-                    premium=premium,
-                    instrument_key=data['pe_key'],
-                    oi_data={
-                        'ce_15m': state.ce_oi_change_15m,
-                        'pe_15m': state.pe_oi_change_15m,
-                        'ce_vel': state.ce_velocity,
-                        'pe_vel': state.pe_velocity
-                    },
-                    stop_loss=premium - sl_points
-                )
-        
-        logger.info("✋ No setup")
-        return None
-
-# ==================== POSITION MANAGER ====================
-class PositionManager:
-    """Manage positions with OI-based exit"""
-    
-    def __init__(self, account: DemoAccount, memory: Memory):
-        self.account = account
-        self.memory = memory
-        self.positions: Dict[str, Position] = {}
-        self.closed: List[Position] = []
-        self.counter = 0
-    
-    def can_open(self) -> Tuple[bool, str]:
-        ok, reason = self.account.can_trade()
-        if not ok:
-            return False, reason
-        if len(self.positions) >= CFG.MAX_OPEN_POSITIONS:
-            return False, f"Max positions ({CFG.MAX_OPEN_POSITIONS})"
-        return True, "OK"
-    
-    def open_position(self, signal: Signal) -> Optional[Position]:
-        ok, reason = self.can_open()
-        if not ok:
-            logger.warning(f"❌ Cannot open: {reason}")
-            return None
-        
-        cost = signal.premium * CFG.LOT_SIZE
-        if cost > self.account.current_balance:
-            logger.warning(f"❌ Need ₹{cost:.0f}, have ₹{self.account.current_balance:.0f}")
-            return None
-        
-        self.counter += 1
-        pos_id = f"P{datetime.now(IST).strftime('%Y%m%d')}_{self.counter:03d}"
-        
-        pos = Position(
-            id=pos_id,
-            trade_type=signal.type,
-            strike=signal.strike,
-            instrument_key=signal.instrument_key,
-            entry_price=signal.premium,
-            entry_time=datetime.now(IST),
-            quantity=1,
-            units=CFG.LOT_SIZE,
-            current_price=signal.premium,
-            highest_price=signal.premium,
-            stop_loss=signal.stop_loss,
-            entry_oi_data=signal.oi_data
-        )
-        
-        self.positions[pos_id] = pos
-        self.account.trades_today += 1
-        
-        logger.info(f"✅ OPENED: {pos_id} | {signal.type.value} {signal.strike} @ ₹{signal.premium:.2f} | SL: ₹{signal.stop_loss:.2f}")
-        
-        return pos
-    
-    def close_position(self, pos_id: str, price: float, reason: ExitReason) -> Optional[Position]:
-        if pos_id not in self.positions:
-            return None
-        
-        pos = self.positions[pos_id]
-        pos.exit_price = price
-        pos.exit_time = datetime.now(IST)
-        pos.exit_reason = reason
-        pos.pnl_points = price - pos.entry_price
-        pos.pnl = pos.pnl_points * pos.units
-        
-        is_win = pos.pnl > 0
-        self.account.update_pnl(pos.pnl, is_win)
-        
-        del self.positions[pos_id]
-        self.closed.append(pos)
-        
-        emoji = "🟢" if is_win else "🔴"
-        logger.info(f"{emoji} CLOSED: {pos_id} | {reason.value} | P&L: ₹{pos.pnl:.2f}")
-        
-        return pos
-    
-    def update_positions(self, state: MarketState) -> List[Tuple[str, ExitReason]]:
-        """Update all positions"""
-        exits = []
-        
-        for pos_id, pos in list(self.positions.items()):
-            # Get current price from all_strikes (includes OTM)
-            strike_data = state.all_strikes.get(pos.strike)
-            
-            if strike_data:
-                if pos.trade_type == TradeType.CE_BUY:
-                    price = strike_data.get('ce_ltp', 0)
-                else:
-                    price = strike_data.get('pe_ltp', 0)
-                
-                if price > 0:
-                    pos.update_price(price)
-            
-            # Check exits
-            reason = self._check_exit(pos, state)
-            if reason:
-                exits.append((pos_id, reason))
-        
-        return exits
-    
-    def _check_exit(self, pos: Position, state: MarketState) -> Optional[ExitReason]:
-        """Check exit conditions"""
-        
-        # Hard SL
-        if pos.current_price <= pos.stop_loss:
-            return ExitReason.STOP_LOSS
-        
-        # Trailing SL
-        if pos.trailing_active and pos.current_price <= pos.trailing_sl:
-            return ExitReason.TRAILING_SL
-        
-        # OI-based exit
-        if self._check_oi_exit(pos, state):
-            return ExitReason.OI_REVERSAL
-        
-        # Activate trailing
-        if pos.pnl_points >= 8:
-            pos.trailing_active = True
-            trail = pos.highest_price - (state.atr * CFG.ATR_TRAILING_MULTIPLIER)
-            if trail > pos.trailing_sl:
-                pos.trailing_sl = trail
-        
-        return None
-    
-    def _check_oi_exit(self, pos: Position, state: MarketState) -> bool:
-        """OI-based exit"""
-        ce_5m = state.ce_oi_change_5m
-        pe_5m = state.pe_oi_change_5m
-        
-        if pos.trade_type == TradeType.CE_BUY:
-            if ce_5m > CFG.OI_EXIT_REVERSAL:
-                logger.info(f"📊 OI Exit: CE building +{ce_5m:.1f}%")
-                return True
-            if state.movement_status == MovementStatus.EXHAUSTING and pos.pnl_points > 0:
-                logger.info("📊 OI Exit: Movement exhausting")
-                return True
-        else:
-            if pe_5m > CFG.OI_EXIT_REVERSAL:
-                logger.info(f"📊 OI Exit: PE building +{pe_5m:.1f}%")
-                return True
-            if state.movement_status == MovementStatus.EXHAUSTING and pos.pnl_points > 0:
-                logger.info("📊 OI Exit: Movement exhausting")
-                return True
-        
-        return False
-
-# ==================== TELEGRAM ====================
-class Telegram:
+class NiftyAnalyzer:
     def __init__(self):
-        self.bot = None
+        self.volume_history = []
+    
+    def calculate_vwap(self, df: pd.DataFrame) -> float:
+        if df.empty:
+            return 0
+        df_copy = df.copy()
+        df_copy['tp'] = (df_copy['high'] + df_copy['low'] + df_copy['close']) / 3
+        df_copy['vol_price'] = df_copy['tp'] * df_copy['vol']
+        total_vol = df_copy['vol'].sum()
+        if total_vol == 0:
+            return df_copy['close'].iloc[-1]
+        vwap = df_copy['vol_price'].cumsum() / df_copy['vol'].cumsum()
+        return vwap.iloc[-1]
+    
+    def calculate_atr(self, df: pd.DataFrame, period: int = ATR_PERIOD) -> float:
+        if len(df) < period:
+            return NIFTY_CONFIG['atr_fallback']
+        df_copy = df.tail(period).copy()
+        df_copy['h-l'] = df_copy['high'] - df_copy['low']
+        df_copy['h-pc'] = abs(df_copy['high'] - df_copy['close'].shift(1))
+        df_copy['l-pc'] = abs(df_copy['low'] - df_copy['close'].shift(1))
+        df_copy['tr'] = df_copy[['h-l', 'h-pc', 'l-pc']].max(axis=1)
+        atr = df_copy['tr'].mean()
+        if atr < 10:
+            return NIFTY_CONFIG['atr_fallback']
+        return atr
+    
+    def get_candle_info(self, df: pd.DataFrame) -> Tuple[str, float, dict]:
+        if df.empty:
+            return 'NEUTRAL', 0, {}
+        last = df.iloc[-1]
+        candle_size = abs(last['close'] - last['open'])
+        if last['close'] > last['open']:
+            color = 'GREEN'
+        elif last['close'] < last['open']:
+            color = 'RED'
+        else:
+            color = 'DOJI'
+        
+        candle_data = {
+            'open': last['open'],
+            'high': last['high'],
+            'low': last['low'],
+            'close': last['close'],
+            'volume': int(last['vol'])
+        }
+        return color, candle_size, candle_data
+    
+    def check_volume_surge(self, current_vol: float) -> Tuple[bool, float]:
+        now = datetime.now(IST)
+        self.volume_history.append({'time': now, 'volume': current_vol})
+        cutoff = now - timedelta(minutes=20)
+        self.volume_history = [x for x in self.volume_history if x['time'] > cutoff]
+        if len(self.volume_history) < 5:
+            return False, 0
+        past_volumes = [x['volume'] for x in self.volume_history[:-1]]
+        avg_vol = sum(past_volumes) / len(past_volumes)
+        if avg_vol == 0:
+            return False, 0
+        multiplier = current_vol / avg_vol
+        return multiplier >= VOL_SPIKE_MULTIPLIER, multiplier
+    
+    def calculate_pcr(self, strike_data: Dict[int, dict]) -> float:
+        total_ce = sum(data['ce_oi'] for data in strike_data.values())
+        total_pe = sum(data['pe_oi'] for data in strike_data.values())
+        return total_pe / total_ce if total_ce > 0 else 1.0
+    
+    def calculate_order_flow_imbalance(self, strike_data: Dict[int, dict]) -> float:
+        ce_vol = sum(data['ce_vol'] for data in strike_data.values())
+        pe_vol = sum(data['pe_vol'] for data in strike_data.values())
+        if ce_vol == 0 and pe_vol == 0:
+            return 1.0
+        elif pe_vol == 0:
+            return 999.0
+        elif ce_vol == 0:
+            return 0.001
+        return ce_vol / pe_vol
+    
+    def calculate_max_pain(self, strike_data: Dict[int, dict], spot_price: float) -> Tuple[int, float]:
+        max_pain_strike = 0
+        min_pain_value = float('inf')
+        for test_strike in strike_data.keys():
+            pain = 0
+            for strike, data in strike_data.items():
+                if test_strike < strike:
+                    pain += data['ce_oi'] * (strike - test_strike)
+                if test_strike > strike:
+                    pain += data['pe_oi'] * (test_strike - strike)
+            if pain < min_pain_value:
+                min_pain_value = pain
+                max_pain_strike = test_strike
+        distance = abs(spot_price - max_pain_strike)
+        logger.info(f"🎯 Max Pain: {max_pain_strike} (Distance: {distance:.0f})")
+        return max_pain_strike, distance
+    
+    def detect_gamma_zone(self, strike_data: Dict[int, dict], atm_strike: int) -> bool:
+        if atm_strike not in strike_data:
+            return False
+        atm_data = strike_data[atm_strike]
+        total_atm_oi = atm_data['ce_oi'] + atm_data['pe_oi']
+        total_oi = sum(d['ce_oi'] + d['pe_oi'] for d in strike_data.values())
+        if total_oi == 0:
+            return False
+        atm_concentration = (total_atm_oi / total_oi) * 100
+        is_gamma_zone = atm_concentration > 30
+        if is_gamma_zone:
+            logger.info(f"⚡ Gamma Zone! ATM OI: {atm_concentration:.1f}%")
+        return is_gamma_zone
+    
+    def check_multi_tf_confirmation(self, ce_5m: float, ce_15m: float, pe_5m: float, pe_15m: float,
+                                   has_5m: bool, has_15m: bool) -> bool:
+        """Enhanced multi-TF check with data availability"""
+        if not (has_5m and has_15m):
+            return False
+        
+        ce_aligned = (ce_5m < -3 and ce_15m < -5) or (ce_5m > 3 and ce_15m > 5)
+        pe_aligned = (pe_5m < -3 and pe_15m < -5) or (pe_5m > 3 and pe_15m > 5)
+        confirmed = ce_aligned or pe_aligned
+        if confirmed:
+            logger.info("✅ Multi-TF Confirmed")
+        return confirmed
+    
+    def check_momentum(self, df: pd.DataFrame, direction: str = 'bullish') -> bool:
+        if df.empty or len(df) < 3:
+            return False
+        last_3 = df.tail(3)
+        if direction == 'bullish':
+            return sum(last_3['close'] > last_3['open']) >= 2
+        else:
+            return sum(last_3['close'] < last_3['open']) >= 2
+
+class NiftyStrikeMaster:
+    def __init__(self, futures_key: str):
+        self.feed = NiftyDataFeed(futures_key)
+        self.redis = RedisBrain()
+        self.analyzer = NiftyAnalyzer()
+        self.telegram = None
+        self.last_signal_time = {}
+        self.hourly_collector = HourlyDataCollector()  # v2.1 NEW
+        
         if TELEGRAM_AVAILABLE and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             try:
-                self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
+                self.telegram = Bot(token=TELEGRAM_BOT_TOKEN)
                 logger.info("✅ Telegram ready")
             except Exception as e:
                 logger.warning(f"⚠️ Telegram: {e}")
     
-    async def send(self, msg: str):
-        if not self.bot:
-            return
-        try:
-            await asyncio.wait_for(
-                self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg),
-                timeout=5
-            )
-        except:
-            pass
-    
-    async def send_trade(self, pos: Position, action: str):
-        if action == "ENTRY":
-            msg = f"🎯 ENTRY\n{pos.trade_type.value} {pos.strike}\n₹{pos.entry_price:.2f} | SL: ₹{pos.stop_loss:.2f}"
-        else:
-            emoji = "✅" if pos.pnl >= 0 else "❌"
-            msg = f"{emoji} EXIT\n{pos.trade_type.value} {pos.strike}\n₹{pos.entry_price:.2f}→₹{pos.exit_price:.2f}\nP&L: ₹{pos.pnl:+.2f}"
-        await self.send(msg)
-    
-    async def send_summary(self, account: DemoAccount, closed: List[Position]):
-        s = account.get_summary()
-        emoji = "🟢" if s['realized'] >= 0 else "🔴"
-        msg = f"""
-📊 DAILY SUMMARY
-
-{emoji} P&L: ₹{s['realized']:+.2f}
-Balance: ₹{s['balance']:.2f}
-Trades: {s['trades']} | Win: {s['win_rate']:.0f}%
-
-🤖 NIFTY v2.2
-"""
-        await self.send(msg)
-
-# ==================== MAIN BOT ====================
-class NiftyBot:
-    def __init__(self):
-        self.account = DemoAccount()
-        self.memory = Memory()
-        self.feed = DataFeed()
-        self.signal_gen = SignalGenerator(self.memory)
-        self.pos_mgr = PositionManager(self.account, self.memory)
-        self.telegram = Telegram()
-        
-        self.running = False
-        self.scan_count = 0
-        self.last_summary = None
-    
-    def get_scan_interval(self, phase: MarketPhase) -> int:
-        """Dynamic scan interval based on phase"""
-        if phase == MarketPhase.PRE_MARKET:
-            return CFG.PREMARKET_SCAN_INTERVAL
-        elif phase == MarketPhase.OPENING:
-            return CFG.OPENING_SCAN_INTERVAL
-        else:
-            return CFG.NORMAL_SCAN_INTERVAL
-    
-    async def scan(self):
-        self.scan_count += 1
+    def _can_send_signal(self, strike: int) -> bool:
         now = datetime.now(IST)
-        
-        logger.info(f"\n{'='*60}")
-        logger.info(f"🔍 SCAN #{self.scan_count} | {now.strftime('%I:%M:%S %p')}")
-        logger.info(f"{'='*60}")
-        
-        # Get state
-        state = await self.feed.get_market_state(self.memory)
-        
-        if state.spot_price == 0:
-            logger.warning("⏳ No data")
-            return state.phase
-        
-        # Update positions
-        exits = self.pos_mgr.update_positions(state)
-        for pos_id, reason in exits:
-            pos = self.pos_mgr.positions.get(pos_id)
-            if pos:
-                closed = self.pos_mgr.close_position(pos_id, pos.current_price, reason)
-                if closed:
-                    await self.telegram.send_trade(closed, "EXIT")
-        
-        # Log positions
-        if self.pos_mgr.positions:
-            for p in self.pos_mgr.positions.values():
-                emoji = "🟢" if p.pnl >= 0 else "🔴"
-                logger.info(f"📍 {p.id}: {p.trade_type.value} {p.strike} | {emoji} ₹{p.pnl:.2f}")
-        
-        # Generate signals (only during trading hours)
-        if state.phase in [MarketPhase.OPENING, MarketPhase.NORMAL]:
-            signal = self.signal_gen.generate(state)
-            if signal:
-                pos = self.pos_mgr.open_position(signal)
-                if pos:
-                    await self.telegram.send_trade(pos, "ENTRY")
-        elif state.phase == MarketPhase.PRE_MARKET:
-            logger.info("📦 Pre-market: Building OI baseline")
-        
-        # Account status
-        s = self.account.get_summary()
-        logger.info(f"💰 Balance: ₹{s['balance']:.2f} | P&L: ₹{s['realized']:+.2f} | Trades: {s['trades']}/{CFG.MAX_TRADES_PER_DAY}")
-        
-        return state.phase
+        key = f"nifty_{strike}"
+        if key in self.last_signal_time:
+            elapsed = (now - self.last_signal_time[key]).total_seconds()
+            if elapsed < SIGNAL_COOLDOWN_SECONDS:
+                logger.info(f"⏳ Signal cooldown: {int(SIGNAL_COOLDOWN_SECONDS - elapsed)}s")
+                return False
+        self.last_signal_time[key] = now
+        return True
     
-    async def check_summary(self):
-        now = datetime.now(IST)
-        if now.time() >= CFG.SUMMARY_TIME and self.last_summary != now.date():
-            self.last_summary = now.date()
-            
-            # Close all positions
-            for pos_id in list(self.pos_mgr.positions.keys()):
-                pos = self.pos_mgr.positions[pos_id]
-                self.pos_mgr.close_position(pos_id, pos.current_price, ExitReason.EOD)
-            
-            await self.telegram.send_summary(self.account, self.pos_mgr.closed)
-    
-    async def run(self):
-        logger.info("="*60)
-        logger.info("🚀 NIFTY50 STRIKE MASTER PRO v2.2")
-        logger.info("="*60)
-        logger.info(f"💰 Capital: ₹{CFG.DEMO_CAPITAL} | Lot: {CFG.LOT_SIZE}")
-        logger.info(f"📊 Fetch: {CFG.FETCH_STRIKES*2+1} strikes | Analysis: {CFG.ANALYSIS_STRIKES*2+1}")
-        logger.info(f"💵 Premium: ₹{CFG.MIN_PREMIUM}-{CFG.MAX_PREMIUM}")
-        logger.info(f"⏰ Start: {CFG.BOT_START} | Trade: {CFG.TRADING_START}")
-        logger.info(f"⚡ Opening: {CFG.OPENING_SCAN_INTERVAL}s | Normal: {CFG.NORMAL_SCAN_INTERVAL}s")
-        
-        if not UPSTOX_ACCESS_TOKEN:
-            logger.error("❌ UPSTOX_ACCESS_TOKEN not set!")
+    async def run_cycle(self):
+        """Main analysis cycle"""
+        if not is_tradeable_time():
             return
         
-        await self.feed.initialize()
+        logger.info(f"\n{'='*80}")
+        logger.info(f"🔍 NIFTY50 ANALYSIS SCAN")
+        logger.info(f"{'='*80}")
         
-        startup = f"""
-🚀 NIFTY v2.2 ONLINE
-
-💰 ₹{CFG.DEMO_CAPITAL} | Lot {CFG.LOT_SIZE}
-📊 31 strikes fetch | 7 analysis
-💵 Premium ₹{CFG.MIN_PREMIUM}-{CFG.MAX_PREMIUM}
-⚡ Opening 5s | Normal 30s
-
-⏰ {datetime.now(IST).strftime('%I:%M %p')}
-"""
-        await self.telegram.send(startup)
+        # Get market data
+        df, strike_data, spot, futures, vol = await self.feed.get_market_data()
+        if df.empty or not strike_data or spot == 0:
+            logger.warning("⏳ Incomplete data, skipping")
+            return
         
-        self.running = True
+        # Calculate technical indicators
+        vwap = self.analyzer.calculate_vwap(df)
+        atr = self.analyzer.calculate_atr(df)
+        pcr = self.analyzer.calculate_pcr(strike_data)
+        candle_color, candle_size, candle_data = self.analyzer.get_candle_info(df)
+        has_vol_spike, vol_mult = self.analyzer.check_volume_surge(vol)
+        vwap_distance = abs(futures - vwap)
+        order_flow = self.analyzer.calculate_order_flow_imbalance(strike_data)
+        max_pain_strike, max_pain_dist = self.analyzer.calculate_max_pain(strike_data, spot)
         
-        while self.running:
-            try:
-                now = datetime.now(IST).time()
-                phase = self.feed.get_market_phase()
+        strike_gap = NIFTY_CONFIG['strike_gap']
+        atm_strike = round(spot / strike_gap) * strike_gap
+        gamma_zone = self.analyzer.detect_gamma_zone(strike_data, atm_strike)
+        
+        # Get total OI
+        total_ce = sum(d['ce_oi'] for d in strike_data.values())
+        total_pe = sum(d['pe_oi'] for d in strike_data.values())
+        
+        # Get OI changes with data availability flags
+        ce_total_15m, pe_total_15m, has_15m_total = self.redis.get_total_oi_change(total_ce, total_pe, 15)
+        ce_total_5m, pe_total_5m, has_5m_total = self.redis.get_total_oi_change(total_ce, total_pe, 5)
+        
+        # Get ATM OI changes
+        atm_ce_15m, atm_pe_15m, has_15m_atm = 0, 0, False
+        atm_ce_5m, atm_pe_5m, has_5m_atm = 0, 0, False
+        atm_data = {}
+        
+        if atm_strike in strike_data:
+            atm_data = strike_data[atm_strike]
+            atm_ce_15m, atm_pe_15m, has_15m_atm = self.redis.get_strike_oi_change(atm_strike, atm_data, 15)
+            atm_ce_5m, atm_pe_5m, has_5m_atm = self.redis.get_strike_oi_change(atm_strike, atm_data, 5)
+            
+            # Display with proper formatting
+            ce_15m_display = f"{atm_ce_15m:+.1f}%" if has_15m_atm else "N/A"
+            pe_15m_display = f"{atm_pe_15m:+.1f}%" if has_15m_atm else "N/A"
+            ce_5m_display = f"{atm_ce_5m:+.1f}%" if has_5m_atm else "N/A"
+            pe_5m_display = f"{atm_pe_5m:+.1f}%" if has_5m_atm else "N/A"
+            
+            logger.info(f"⚔️ ATM {atm_strike}: 15m CE={ce_15m_display} PE={pe_15m_display} | 5m CE={ce_5m_display} PE={pe_5m_display}")
+        else:
+            logger.info(f"⚠️ ATM strike {atm_strike} data not available")
+        
+        # Check multi-TF confirmation
+        multi_tf = self.analyzer.check_multi_tf_confirmation(
+            ce_total_5m, ce_total_15m, pe_total_5m, pe_total_15m,
+            has_5m_total, has_15m_total
+        )
+        
+        # Save current data
+        for strike, data in strike_data.items():
+            self.redis.save_strike_snapshot(strike, data)
+        self.redis.save_total_oi_snapshot(total_ce, total_pe)
+        
+        # Check warmup status
+        mem_stats = self.redis.get_memory_stats()
+        if not mem_stats['warmed_up_15m']:
+            logger.warning(f"⏳ Warmup: {mem_stats['elapsed_minutes']:.1f}/15 min | Snapshots: {mem_stats['snapshot_count']}")
+        
+        # Log current data
+        logger.info(f"💰 Spot: {spot:.2f} | Futures: {futures:.2f}")
+        logger.info(f"📊 VWAP: {vwap:.2f} | PCR: {pcr:.2f} | Candle: {candle_color}")
+        logger.info(f"📉 Total OI 15m: CE={ce_total_15m:+.1f}% | PE={pe_total_15m:+.1f}% {'(N/A)' if not has_15m_total else ''}")
+        logger.info(f"📉 Total OI 5m: CE={ce_total_5m:+.1f}% | PE={pe_total_5m:+.1f}% {'(N/A)' if not has_5m_total else ''}")
+        
+        # Check momentum
+        bullish_momentum = self.analyzer.check_momentum(df, 'bullish')
+        bearish_momentum = self.analyzer.check_momentum(df, 'bearish')
+        
+        # Create complete analysis data
+        analysis = AnalysisData(
+            spot_price=spot,
+            futures_price=futures,
+            atm_strike=atm_strike,
+            vwap=vwap,
+            atr=atr,
+            pcr=pcr,
+            total_ce_oi=total_ce,
+            total_pe_oi=total_pe,
+            atm_ce_oi=atm_data.get('ce_oi', 0),
+            atm_pe_oi=atm_data.get('pe_oi', 0),
+            atm_ce_vol=atm_data.get('ce_vol', 0),
+            atm_pe_vol=atm_data.get('pe_vol', 0),
+            ce_oi_15m=ce_total_15m,
+            pe_oi_15m=pe_total_15m,
+            ce_oi_5m=ce_total_5m,
+            pe_oi_5m=pe_total_5m,
+            atm_ce_change_15m=atm_ce_15m,
+            atm_pe_change_15m=atm_pe_15m,
+            atm_ce_change_5m=atm_ce_5m,
+            atm_pe_change_5m=atm_pe_5m,
+            candle_color=candle_color,
+            candle_size=candle_size,
+            open_price=candle_data['open'],
+            high_price=candle_data['high'],
+            low_price=candle_data['low'],
+            close_price=candle_data['close'],
+            current_volume=candle_data['volume'],
+            vwap_distance=vwap_distance,
+            volume_surge=vol_mult,
+            has_volume_spike=has_vol_spike,
+            order_flow_imbalance=order_flow,
+            max_pain_strike=max_pain_strike,
+            max_pain_distance=max_pain_dist,
+            gamma_zone=gamma_zone,
+            multi_tf_confirm=multi_tf,
+            bullish_momentum=bullish_momentum,
+            bearish_momentum=bearish_momentum,
+            strike_data_summary=strike_data,
+            data_quality={
+                'has_15m_total_oi': has_15m_total,
+                'has_5m_total_oi': has_5m_total,
+                'has_15m_atm_oi': has_15m_atm,
+                'has_5m_atm_oi': has_5m_atm,
+                'warmed_up': mem_stats['warmed_up_15m']
+            },
+            warnings=[]
+        )
+        
+        # Add warnings
+        if not has_15m_total:
+            analysis.warnings.append("15m total OI data not available")
+        if not has_15m_atm:
+            analysis.warnings.append("15m ATM OI data not available")
+        
+        # Send hourly update (v2.1 NEW)
+        await self.send_hourly_update(
+            spot, futures, atm_strike, vwap, atr, pcr,
+            total_ce, total_pe, ce_total_15m, pe_total_15m,
+            atm_data.get('ce_oi', 0), atm_data.get('pe_oi', 0),
+            atm_ce_15m, atm_pe_15m,
+            candle_data, vol
+        )
+        
+        # Generate signal with complete analysis
+        signal = self.generate_signal(
+            spot, futures, vwap, vwap_distance, pcr, atr,
+            ce_total_15m, pe_total_15m, ce_total_5m, pe_total_5m,
+            atm_ce_15m, atm_pe_15m, candle_color, candle_size,
+            has_vol_spike, vol_mult, df, order_flow, max_pain_dist, 
+            gamma_zone, multi_tf, atm_strike, strike_data,
+            has_15m_total, has_15m_atm, has_5m_total, has_5m_atm,
+            analysis
+        )
+        
+        if signal:
+            if self._can_send_signal(signal.strike):
+                await self.send_alert(signal)
+            else:
+                logger.info(f"✋ Duplicate signal blocked for strike {signal.strike}")
+        else:
+            logger.info("✋ No setup found")
+        
+        logger.info(f"{'='*80}\n")
+    
+    def generate_signal(self, spot_price, futures_price, vwap, vwap_distance, pcr, atr,
+                       ce_total_15m, pe_total_15m, ce_total_5m, pe_total_5m,
+                       atm_ce_change, atm_pe_change, candle_color, candle_size,
+                       has_vol_spike, vol_mult, df, order_flow, max_pain_dist,
+                       gamma_zone, multi_tf, atm_strike, strike_data,
+                       has_15m_total, has_15m_atm, has_5m_total, has_5m_atm,
+                       analysis: AnalysisData) -> Optional[Signal]:
+        """Enhanced signal generation with data quality checks"""
+        
+        stop_loss_points = int(atr * ATR_SL_MULTIPLIER)
+        target_points = int(atr * ATR_TARGET_MULTIPLIER)
+        
+        # Adjust targets based on OI strength
+        if abs(ce_total_15m) >= OI_THRESHOLD_STRONG or abs(atm_ce_change) >= OI_THRESHOLD_STRONG:
+            target_points = max(target_points, 80)
+        elif abs(ce_total_15m) >= OI_THRESHOLD_MEDIUM or abs(atm_ce_change) >= OI_THRESHOLD_MEDIUM:
+            target_points = max(target_points, 50)
+        
+        lot_size = NIFTY_CONFIG['lot_size']
+        quantity = 1
+        
+        atm_data = strike_data.get(atm_strike, {})
+        atm_ce_oi = atm_data.get('ce_oi', 0)
+        atm_pe_oi = atm_data.get('pe_oi', 0)
+        atm_ce_vol = atm_data.get('ce_vol', 0)
+        atm_pe_vol = atm_data.get('pe_vol', 0)
+        
+        # CE BUY SIGNAL
+        if (ce_total_15m < -OI_THRESHOLD_MEDIUM and has_15m_total) or \
+           (atm_ce_change < -ATM_OI_THRESHOLD and has_15m_atm):
+            
+            checks = {
+                "CE OI Unwinding (15m)": ce_total_15m < -OI_THRESHOLD_MEDIUM and has_15m_total,
+                "ATM CE Unwinding (15m)": atm_ce_change < -ATM_OI_THRESHOLD and has_15m_atm,
+                "Price > VWAP": futures_price > vwap,
+                "GREEN Candle": candle_color == 'GREEN'
+            }
+            
+            bonus = {
+                "Strong 5m CE Unwinding": ce_total_5m < -5.0 and has_5m_total,
+                "Big Candle": candle_size >= MIN_CANDLE_SIZE,
+                "Far from VWAP": vwap_distance >= VWAP_BUFFER,
+                "Bullish PCR": pcr > PCR_BULLISH,
+                "Volume Spike": has_vol_spike,
+                "Bullish Momentum": self.analyzer.check_momentum(df, 'bullish'),
+                "Order Flow Bullish": order_flow < 1.0,
+                "Multi-TF Confirmed": multi_tf,
+                "Gamma Zone": gamma_zone,
+                "ATM Strong Unwinding": atm_ce_change < -8.0 and has_15m_atm
+            }
+            
+            passed = sum(checks.values())
+            bonus_passed = sum(bonus.values())
+            
+            # Require at least 3 main checks AND good data quality
+            if passed >= 3 and (has_15m_total or has_15m_atm):
+                confidence = 70 + (passed * 5) + (bonus_passed * 3)
+                confidence = min(confidence, 98)
                 
-                if phase != MarketPhase.CLOSED:
-                    current_phase = await self.scan()
-                    await self.check_summary()
-                    interval = self.get_scan_interval(current_phase)
-                    await asyncio.sleep(interval)
-                else:
-                    # Reset at day start
-                    if now < CFG.BOT_START:
-                        self.account.reset_daily()
-                        self.pos_mgr.closed = []
-                        self.feed.day_open = 0
-                        self.feed.day_high = 0
-                        self.feed.day_low = 999999
-                        self.memory.yesterday_oi = {}
-                        self.memory.warmup_done = False
-                    
-                    logger.info("🌙 Market closed")
-                    await asyncio.sleep(60)
-                    
-            except KeyboardInterrupt:
-                self.running = False
-            except Exception as e:
-                logger.error(f"💥 Error: {e}")
-                import traceback
-                traceback.print_exc()
-                await asyncio.sleep(10)
+                if confidence >= 90:
+                    quantity = 2
+                
+                logger.info(f"🎯 CE BUY SIGNAL! Confidence: {confidence}%")
+                logger.info(f"   Checks passed: {passed}/4 | Bonus: {bonus_passed}/10")
+                
+                return Signal(
+                    type="CE_BUY",
+                    reason=f"Call Unwinding (Total: {ce_total_15m:.1f}%, ATM: {atm_ce_change:.1f}%)",
+                    confidence=confidence,
+                    spot_price=spot_price,
+                    futures_price=futures_price,
+                    strike=atm_strike,
+                    target_points=target_points,
+                    stop_loss_points=stop_loss_points,
+                    pcr=pcr,
+                    candle_color=candle_color,
+                    volume_surge=vol_mult,
+                    oi_5m=ce_total_5m,
+                    oi_15m=ce_total_15m,
+                    atm_ce_change=atm_ce_change,
+                    atm_pe_change=atm_pe_change,
+                    atr=atr,
+                    timestamp=datetime.now(IST),
+                    order_flow_imbalance=order_flow,
+                    max_pain_distance=max_pain_dist,
+                    gamma_zone=gamma_zone,
+                    multi_tf_confirm=multi_tf,
+                    lot_size=lot_size,
+                    quantity=quantity,
+                    atm_ce_oi=atm_ce_oi,
+                    atm_pe_oi=atm_pe_oi,
+                    atm_ce_vol=atm_ce_vol,
+                    atm_pe_vol=atm_pe_vol,
+                    analysis=analysis
+                )
         
-        logger.info("👋 Bot stopped")
+        # PE BUY SIGNAL
+        if (pe_total_15m < -OI_THRESHOLD_MEDIUM and has_15m_total) or \
+           (atm_pe_change < -ATM_OI_THRESHOLD and has_15m_atm):
+            
+            if abs(pe_total_15m) >= OI_THRESHOLD_STRONG or abs(atm_pe_change) >= OI_THRESHOLD_STRONG:
+                target_points = max(target_points, 80)
+            
+            checks = {
+                "PE OI Unwinding (15m)": pe_total_15m < -OI_THRESHOLD_MEDIUM and has_15m_total,
+                "ATM PE Unwinding (15m)": atm_pe_change < -ATM_OI_THRESHOLD and has_15m_atm,
+                "Price < VWAP": futures_price < vwap,
+                "RED Candle": candle_color == 'RED'
+            }
+            
+            bonus = {
+                "Strong 5m PE Unwinding": pe_total_5m < -5.0 and has_5m_total,
+                "Big Candle": candle_size >= MIN_CANDLE_SIZE,
+                "Far from VWAP": vwap_distance >= VWAP_BUFFER,
+                "Bearish PCR": pcr < PCR_BEARISH,
+                "Volume Spike": has_vol_spike,
+                "Bearish Momentum": self.analyzer.check_momentum(df, 'bearish'),
+                "Order Flow Bearish": order_flow > 1.5,
+                "Multi-TF Confirmed": multi_tf,
+                "Gamma Zone": gamma_zone
+            }
+            
+            passed = sum(checks.values())
+            bonus_passed = sum(bonus.values())
+            
+            if passed >= 3 and (has_15m_total or has_15m_atm):
+                confidence = 70 + (passed * 5) + (bonus_passed * 3)
+                confidence = min(confidence, 98)
+                
+                if confidence >= 90:
+                    quantity = 2
+                
+                logger.info(f"🎯 PE BUY SIGNAL! Confidence: {confidence}%")
+                logger.info(f"   Checks passed: {passed}/4 | Bonus: {bonus_passed}/9")
+                
+                return Signal(
+                    type="PE_BUY",
+                    reason=f"Put Unwinding (Total: {pe_total_15m:.1f}%, ATM: {atm_pe_change:.1f}%)",
+                    confidence=confidence,
+                    spot_price=spot_price,
+                    futures_price=futures_price,
+                    strike=atm_strike,
+                    target_points=target_points,
+                    stop_loss_points=stop_loss_points,
+                    pcr=pcr,
+                    candle_color=candle_color,
+                    volume_surge=vol_mult,
+                    oi_5m=pe_total_5m,
+                    oi_15m=pe_total_15m,
+                    atm_ce_change=atm_ce_change,
+                    atm_pe_change=atm_pe_change,
+                    atr=atr,
+                    timestamp=datetime.now(IST),
+                    order_flow_imbalance=order_flow,
+                    max_pain_distance=max_pain_dist,
+                    gamma_zone=gamma_zone,
+                    multi_tf_confirm=multi_tf,
+                    lot_size=lot_size,
+                    quantity=quantity,
+                    atm_ce_oi=atm_ce_oi,
+                    atm_pe_oi=atm_pe_oi,
+                    atm_ce_vol=atm_ce_vol,
+                    atm_pe_vol=atm_pe_vol,
+                    analysis=analysis
+                )
+        
+        return None
+    
 
-# ==================== MAIN ====================
+    async def send_hourly_update(self, spot, futures, atm_strike, vwap, atr, pcr,
+                                 total_ce, total_pe, ce_15m, pe_15m, 
+                                 atm_ce_oi, atm_pe_oi, atm_ce_15m, atm_pe_15m,
+                                 candle_data, volume):
+        """Send hourly market data update to Telegram"""
+        if not HOURLY_UPDATE_ENABLED:
+            return
+        
+        if not self.hourly_collector.should_send_hourly_update():
+            return
+        
+        # Collect snapshot
+        snapshot = self.hourly_collector.collect_hourly_snapshot(
+            spot, futures, atm_strike, vwap, atr, pcr,
+            total_ce, total_pe, ce_15m, pe_15m,
+            atm_ce_oi, atm_pe_oi, atm_ce_15m, atm_pe_15m,
+            candle_data, volume
+        )
+        
+        # Generate message
+        message = self.hourly_collector.generate_hourly_json_message(snapshot)
+        
+        # Send to Telegram
+        if self.telegram:
+            try:
+                await asyncio.wait_for(
+                    self.telegram.send_message(chat_id=TELEGRAM_CHAT_ID, text=message),
+                    timeout=TELEGRAM_TIMEOUT
+                )
+                logger.info(f"✅ Hourly update sent: {snapshot['hour']}")
+                self.hourly_collector.last_hourly_update = datetime.now(IST)
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Hourly update timed out")
+            except Exception as e:
+                logger.error(f"❌ Hourly update error: {e}")
+    
+    async def send_alert(self, s: Signal):
+        """Send enhanced alert with complete analysis data"""
+        if s.type == "CE_BUY":
+            entry = s.spot_price
+            target = entry + s.target_points
+            stop_loss = entry - s.stop_loss_points
+            emoji = "🟢"
+            target_direction = "+"
+            sl_direction = "-"
+        else:
+            entry = s.spot_price
+            target = entry - s.target_points
+            stop_loss = entry + s.stop_loss_points
+            emoji = "🔴"
+            target_direction = "-"
+            sl_direction = "+"
+        
+        mode = "🧪 ALERT ONLY" if ALERT_ONLY_MODE else "⚡ LIVE"
+        timestamp_str = s.timestamp.strftime('%d-%b %I:%M %p')
+        risk = abs(entry - stop_loss)
+        reward = abs(target - entry)
+        rr_ratio = reward / risk if risk > 0 else 0
+        
+        # Build main signal message
+        msg = f"""
+{emoji} NIFTY50 STRIKE MASTER PRO v2.0
+
+{mode}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+⚡ SIGNAL: {s.type}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+📍 Entry: {entry:.1f}
+🎯 Target: {target:.1f} ({target_direction}{s.target_points:.0f} pts)
+🛑 Stop Loss: {stop_loss:.1f} ({sl_direction}{s.stop_loss_points:.0f} pts)
+📊 Strike: {s.strike}
+📦 Quantity: {s.quantity} lots ({s.quantity * s.lot_size} units)
+💎 Risk:Reward = 1:{rr_ratio:.1f}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+📊 LOGIC & CONFIDENCE
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+{s.reason}
+Confidence: {s.confidence}%
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+💰 MARKET DATA
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+Spot: {s.spot_price:.1f}
+Futures: {s.futures_price:.1f}
+PCR: {s.pcr:.2f}
+Candle: {s.candle_color}
+Volume: {s.volume_surge:.1f}x
+ATR: {s.atr:.1f}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+📉 OI ANALYSIS (Multi-TF)
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+Total OI Change:
+  5m:  CE={s.oi_5m:+.1f}% | PE={-s.oi_5m:+.1f}%
+  15m: CE={s.oi_15m:+.1f}% | PE={-s.oi_15m:+.1f}%
+
+ATM Strike {s.strike}:
+  CE: {s.atm_ce_change:+.1f}% {"(N/A)" if s.atm_ce_change == 0 else ""}
+  PE: {s.atm_pe_change:+.1f}% {"(N/A)" if s.atm_pe_change == 0 else ""}
+
+ATM OI Levels:
+  CE OI: {s.atm_ce_oi:,} | Vol: {s.atm_ce_vol:,}
+  PE OI: {s.atm_pe_oi:,} | Vol: {s.atm_pe_vol:,}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+🔥 ADVANCED METRICS
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+Order Flow: {s.order_flow_imbalance:.2f}
+{"  (CE Buying)" if s.order_flow_imbalance < 1.0 else "  (PE Buying)"}
+
+Max Pain: {s.max_pain_distance:.0f} pts away
+
+{"⚡ Gamma Zone: ACTIVE" if s.gamma_zone else ""}
+{"✅ Multi-TF: CONFIRMED" if s.multi_tf_confirm else ""}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+⏰ {timestamp_str}
+
+✅ v2.0 - Complete Analysis
+"""
+        
+        logger.info(f"🚨 {s.type} @ {entry:.1f} → Target: {target:.1f} | SL: {stop_loss:.1f}")
+        
+        # Send main signal
+        if self.telegram:
+            try:
+                await asyncio.wait_for(
+                    self.telegram.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg),
+                    timeout=TELEGRAM_TIMEOUT
+                )
+                logger.info("✅ Alert sent to Telegram")
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Telegram alert timed out")
+            except Exception as e:
+                logger.error(f"❌ Telegram error: {e}")
+        
+        # Send detailed analysis if enabled
+        if SEND_ANALYSIS_DATA and s.analysis and self.telegram:
+            await self.send_analysis_data(s.analysis, s.type)
+    
+    async def send_analysis_data(self, analysis: AnalysisData, signal_type: str):
+        """Send complete analysis data for transparency"""
+        timestamp_str = analysis.timestamp.strftime('%d-%b %I:%M %p')
+        
+        # Format strike data
+        strike_summary = []
+        for strike, data in sorted(analysis.strike_data_summary.items()):
+            ce_oi = data['ce_oi']
+            pe_oi = data['pe_oi']
+            ce_vol = data['ce_vol']
+            pe_vol = data['pe_vol']
+            mark = "🎯" if strike == analysis.atm_strike else "  "
+            strike_summary.append(f"{mark}{strike}: CE OI={ce_oi:,} Vol={ce_vol:,} | PE OI={pe_oi:,} Vol={pe_vol:,}")
+        
+        strikes_text = "\n".join(strike_summary[:5])  # Top 5 strikes
+        
+        # Data quality status
+        quality_items = []
+        for key, value in analysis.data_quality.items():
+            status = "✅" if value else "❌"
+            quality_items.append(f"{status} {key.replace('_', ' ').title()}")
+        quality_text = "\n".join(quality_items)
+        
+        # Warnings
+        warnings_text = "\n".join([f"⚠️ {w}" for w in analysis.warnings]) if analysis.warnings else "✅ No warnings"
+        
+        analysis_msg = f"""
+📊 COMPLETE ANALYSIS DATA
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+🕐 Time: {timestamp_str}
+📍 Signal: {signal_type}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+💰 PRICE DATA
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+Spot: {analysis.spot_price:.2f}
+Futures: {analysis.futures_price:.2f}
+VWAP: {analysis.vwap:.2f}
+Distance from VWAP: {analysis.vwap_distance:.2f}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+🕯️ CANDLE DATA
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+Color: {analysis.candle_color}
+Size: {analysis.candle_size:.2f}
+Open: {analysis.open_price:.2f}
+High: {analysis.high_price:.2f}
+Low: {analysis.low_price:.2f}
+Close: {analysis.close_price:.2f}
+Volume: {analysis.current_volume:,}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+📈 TECHNICAL INDICATORS
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+ATR: {analysis.atr:.2f}
+PCR: {analysis.pcr:.2f}
+Order Flow: {analysis.order_flow_imbalance:.2f}
+Volume Surge: {analysis.volume_surge:.1f}x
+Has Spike: {"Yes" if analysis.has_volume_spike else "No"}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+📊 OI DATA (Total)
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+Total CE OI: {analysis.total_ce_oi:,}
+Total PE OI: {analysis.total_pe_oi:,}
+
+15m Changes:
+  CE: {analysis.ce_oi_15m:+.1f}%
+  PE: {analysis.pe_oi_15m:+.1f}%
+
+5m Changes:
+  CE: {analysis.ce_oi_5m:+.1f}%
+  PE: {analysis.pe_oi_5m:+.1f}%
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 ATM STRIKE {analysis.atm_strike}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+CE OI: {analysis.atm_ce_oi:,}
+PE OI: {analysis.atm_pe_oi:,}
+CE Vol: {analysis.atm_ce_vol:,}
+PE Vol: {analysis.atm_pe_vol:,}
+
+15m Changes:
+  CE: {analysis.atm_ce_change_15m:+.1f}%
+  PE: {analysis.atm_pe_change_15m:+.1f}%
+
+5m Changes:
+  CE: {analysis.atm_ce_change_5m:+.1f}%
+  PE: {analysis.atm_pe_change_5m:+.1f}%
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+🎲 ADVANCED ANALYSIS
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+Max Pain: {analysis.max_pain_strike}
+Distance: {analysis.max_pain_distance:.0f} pts
+
+Gamma Zone: {"Yes ⚡" if analysis.gamma_zone else "No"}
+Multi-TF: {"Confirmed ✅" if analysis.multi_tf_confirm else "Not Confirmed"}
+Bullish Momentum: {"Yes" if analysis.bullish_momentum else "No"}
+Bearish Momentum: {"Yes" if analysis.bearish_momentum else "No"}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+📋 STRIKE DATA
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+{strikes_text}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+✅ DATA QUALITY
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+{quality_text}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ WARNINGS
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+{warnings_text}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 Use this data to verify the signal
+and make informed trading decisions!
+"""
+        
+        if self.telegram:
+            try:
+                await asyncio.wait_for(
+                    self.telegram.send_message(chat_id=TELEGRAM_CHAT_ID, text=analysis_msg),
+                    timeout=TELEGRAM_TIMEOUT
+                )
+                logger.info("✅ Analysis data sent to Telegram")
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Analysis data timed out")
+            except Exception as e:
+                logger.error(f"❌ Analysis send error: {e}")
+    
+    async def send_startup_message(self):
+        """Send startup notification"""
+        now = datetime.now(IST)
+        startup_time = now.strftime('%d-%b %I:%M %p')
+        mode = "🧪 ALERT ONLY" if ALERT_ONLY_MODE else "⚡ LIVE TRADING"
+        expiry_weekly = get_next_tuesday_expiry().strftime('%d-%b-%Y')
+        expiry_monthly = get_monthly_expiry().strftime('%d-%b-%Y')
+        
+        msg = f"""
+🚀 NIFTY50 STRIKE MASTER PRO v2.0
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+✅ STATUS
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+⏰ Started: {startup_time}
+📊 Index: NIFTY 50
+🔄 Mode: {mode}
+✅ ALL SYSTEMS OPERATIONAL
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+📅 CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+Weekly Expiry: {expiry_weekly}
+Monthly Expiry: {expiry_monthly}
+
+Futures: {self.feed.futures_symbol}
+Strikes: 5 (ATM ± 2 × 50)
+Lot Size: {NIFTY_CONFIG['lot_size']}
+Scan: Every {SCAN_INTERVAL}s
+
+Memory TTL: {MEMORY_TTL_SECONDS/3600:.1f} hours
+Signal Cooldown: {SIGNAL_COOLDOWN_SECONDS/60:.0f} min
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+🔥 NEW FEATURES v2.1
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ Optimized Thresholds (4%, 2.5%, 3%)
+✅ Hourly JSON Updates to Telegram
+✅ Complete Analysis Data in Alerts
+✅ Enhanced OI Tracking (2h TTL)
+✅ Better Data Quality Checks
+✅ Auto-detect Spot Price Format
+✅ Multi-timeframe Validation
+✅ Detailed Strike Data
+✅ Data Quality Warnings
+✅ Enhanced Debugging
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+📊 ANALYSIS FEATURES
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ 500 Futures Candles (1-min)
+✅ Multi-TF OI (5m + 15m)
+✅ VWAP & ATR Analysis
+✅ PCR & Order Flow
+✅ Gamma Zone Detection
+✅ Max Pain Calculation
+✅ Volume Spike Detection
+✅ Smart Rate Limiting
+✅ Enhanced Redis Memory
+✅ Duplicate Signal Filter
+✅ Data Availability Checks
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 System Active | Ready to Scan
+📊 Detailed Analysis: {"ON" if SEND_ANALYSIS_DATA else "OFF"}
+"""
+        if self.telegram:
+            try:
+                await asyncio.wait_for(
+                    self.telegram.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg),
+                    timeout=TELEGRAM_TIMEOUT
+                )
+                logger.info("✅ Startup message sent")
+            except:
+                pass
+
 async def main():
-    bot = NiftyBot()
-    await bot.run()
+    logger.info("=" * 80)
+    logger.info("🚀 NIFTY50 STRIKE MASTER PRO v2.0 - ENHANCED")
+    logger.info("=" * 80)
+    logger.info("")
+    logger.info("📊 Index: NIFTY 50")
+    logger.info(f"🔔 Mode: {'ALERT ONLY' if ALERT_ONLY_MODE else 'LIVE TRADING'}")
+    logger.info(f"⏱️ Scan Interval: {SCAN_INTERVAL} seconds")
+    logger.info(f"📊 Send Analysis: {'YES' if SEND_ANALYSIS_DATA else 'NO'}")
+    logger.info("")
+    
+    # Fetch futures instrument key
+    logger.info("🔍 Finding correct futures instrument...")
+    futures_key = await fetch_futures_instrument_key()
+    
+    if not futures_key:
+        logger.error("❌ Could not find futures instrument!")
+        logger.error("   Check if NIFTY futures are available for current expiry")
+        return
+    
+    logger.info("")
+    
+    try:
+        bot = NiftyStrikeMaster(futures_key)
+        logger.info("✅ Bot initialized")
+    except Exception as e:
+        logger.error(f"❌ Initialization failed: {e}")
+        return
+    
+    logger.info("")
+    logger.info("🔥 ENHANCED FEATURES v2.0:")
+    logger.info("   ✅ Complete Analysis Data in Telegram")
+    logger.info("   ✅ Fixed OI Tracking (2h TTL)")
+    logger.info("   ✅ Better Data Quality Checks")
+    logger.info("   ✅ Auto-detect Spot Price Format")
+    logger.info("   ✅ Enhanced Multi-TF Validation")
+    logger.info("   ✅ Detailed Strike Analysis")
+    logger.info("   ✅ Data Availability Warnings")
+    logger.info("   ✅ Professional Grade Signals")
+    logger.info("")
+    logger.info("=" * 80)
+    
+    await bot.send_startup_message()
+    iteration = 0
+    
+    while True:
+        try:
+            now = datetime.now(IST).time()
+            if time(9, 15) <= now <= time(15, 30):
+                iteration += 1
+                logger.info(f"\n{'='*80}")
+                logger.info(f"🔄 SCAN #{iteration} - {datetime.now(IST).strftime('%I:%M:%S %p')}")
+                logger.info(f"{'='*80}")
+                await bot.run_cycle()
+                await asyncio.sleep(SCAN_INTERVAL)
+            else:
+                logger.info("🌙 Market closed, waiting...")
+                await asyncio.sleep(300)
+        except KeyboardInterrupt:
+            logger.info("\n🛑 Stopped by user")
+            break
+        except Exception as e:
+            logger.error(f"💥 Critical error: {e}")
+            import traceback
+            traceback.print_exc()
+            await asyncio.sleep(30)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 Goodbye!")
+        logger.info("\n👋 Shutdown complete")
