@@ -117,6 +117,20 @@ TRAILING_SL_DISTANCE = 0.4         # Trail at 40% from peak
 USE_PREMIUM_SL = True
 PREMIUM_SL_PERCENT = 30            # 30% of premium paid
 
+# =======================
+# API Configuration
+# =======================
+API_VERSION = 'v3'  # Using V3 for market data (V2 deprecated June 2025)
+UPSTOX_BASE_URL = 'https://api.upstox.com'
+
+# V3 Endpoints (New)
+UPSTOX_QUOTE_URL_V3 = f'{UPSTOX_BASE_URL}/v3/quote'
+UPSTOX_HISTORICAL_URL_V3 = f'{UPSTOX_BASE_URL}/v3/historical-candle'
+
+# V2 Endpoints (Still supported for Option Chain)
+UPSTOX_OPTION_CHAIN_URL = f'{UPSTOX_BASE_URL}/v2/option/chain'
+UPSTOX_INSTRUMENTS_URL = f'{UPSTOX_BASE_URL}/v2/market-quote/instrument'
+
 # Rate Limiting
 RATE_LIMIT_PER_SECOND = 50
 RATE_LIMIT_PER_MINUTE = 500
@@ -656,21 +670,48 @@ class RedisBrain:
                         break
         
         if not past_data_str:
-            # Enhanced debugging
+            # Enhanced debugging - show what we tried
             logger.info(f"   ❌ Not found. Tried: {', '.join(tried_keys)}")
             
-            # Show what we actually have
-            if not self.client and self.memory:
-                strike_keys = [k for k in self.memory.keys() if f"strike:{strike}:" in k]
-                if strike_keys:
-                    # Extract timestamps from keys and show range
-                    times = sorted([k.split(':')[-1][-4:] for k in strike_keys])
+            # Show available data range (check both Redis and RAM)
+            available_keys = []
+            
+            # Check Redis first
+            if self.client:
+                try:
+                    # Use Redis SCAN to find matching keys
+                    pattern = f"nifty:strike:{strike}:*"
+                    cursor = 0
+                    while True:
+                        cursor, keys = self.client.scan(cursor, match=pattern, count=100)
+                        available_keys.extend([k.decode() if isinstance(k, bytes) else k for k in keys])
+                        if cursor == 0:
+                            break
+                except Exception as e:
+                    logger.info(f"   ⚠️ Redis scan failed: {e}")
+            
+            # Fallback to RAM
+            if not available_keys and self.memory:
+                available_keys = [k for k in self.memory.keys() if f"strike:{strike}:" in k]
+            
+            if available_keys:
+                # Extract timestamps and show range
+                try:
+                    times = sorted([k.split(':')[-1][-4:] for k in available_keys])
                     if times:
                         first_time = f"{times[0][:2]}:{times[0][2:]}"
                         last_time = f"{times[-1][:2]}:{times[-1][2:]}"
                         logger.info(f"   📋 Available: {first_time} to {last_time} ({len(times)} snapshots)")
-                else:
-                    logger.info(f"   📋 No data for strike {strike} yet!")
+                        
+                        # Show gap analysis
+                        looking_for_ts = timestamp.strftime('%H%M')
+                        if times[0] > looking_for_ts:
+                            gap = int(times[0][:2])*60 + int(times[0][2:]) - (int(looking_for_ts[:2])*60 + int(looking_for_ts[2:]))
+                            logger.info(f"   ⏰ Bot started {gap} min after requested time")
+                except Exception as e:
+                    logger.info(f"   ⚠️ Could not parse times: {e}")
+            else:
+                logger.info(f"   📋 No data for strike {strike} yet - ATM just changed?")
             
             return 0.0, 0.0, False
         
@@ -785,7 +826,8 @@ class NiftyDataFeed:
             # 1. SPOT PRICE
             logger.info("🔍 Fetching spot...")
             enc_spot = urllib.parse.quote(self.spot_key, safe='')
-            spot_url = f"https://api.upstox.com/v2/market-quote/quotes?symbol={enc_spot}"
+            # V3 Quote API
+            spot_url = f"{UPSTOX_QUOTE_URL_V3}?symbol={enc_spot}"
             
             spot_data = await self.fetch_with_retry(spot_url, session)
             if spot_data and spot_data.get('status') == 'success':
@@ -798,7 +840,8 @@ class NiftyDataFeed:
             # 2. FUTURES CANDLES
             logger.info(f"🔍 Fetching futures...")
             enc_futures = urllib.parse.quote(self.futures_key, safe='')
-            candle_url = f"https://api.upstox.com/v2/historical-candle/intraday/{enc_futures}/1minute"
+            # V3 Historical Candle API
+            candle_url = f"{UPSTOX_HISTORICAL_URL_V3}/intraday/{enc_futures}/1minute"
             
             candle_data = await self.fetch_with_retry(candle_url, session)
             if candle_data and candle_data.get('status') == 'success':
@@ -826,7 +869,8 @@ class NiftyDataFeed:
             logger.info(f"📅 Expiry: {expiry_str} (Tuesday)")
             
             enc_index = urllib.parse.quote(self.spot_key, safe='')
-            chain_url = f"https://api.upstox.com/v2/option/chain?instrument_key={enc_index}&expiry_date={expiry_str}"
+            # V2 Option Chain API (V3 not yet available for options)
+            chain_url = f"{UPSTOX_OPTION_CHAIN_URL}?instrument_key={enc_index}&expiry_date={expiry_str}"
             
             strike_gap = NIFTY_CONFIG['strike_gap']
             atm_strike = round(spot_price / strike_gap) * strike_gap
@@ -1203,12 +1247,12 @@ class NiftyStrikeMaster:
             mem_stats = self.redis.get_memory_stats()
             
             if not mem_stats['warmed_up_10m']:
-                logger.info(f"⏳ WARMUP IN PROGRESS")
+                logger.info(f"⏳ WARMUP IN PROGRESS - Blocking signals")
                 logger.info(f"   Need 10 min for reliable signals")
                 logger.info(f"   Elapsed: {mem_stats['elapsed_minutes']:.1f} min")
                 logger.info(f"   5m data: {'✅ Ready' if mem_stats['warmed_up_5m'] else '⏳ Not yet'}")
                 logger.info(f"   15m data: {'✅ Ready' if mem_stats['warmed_up_10m'] else '⏳ Not yet'}")
-                # Still generate signal if data available, but log warmup status
+                return  # ← BLOCK SIGNALS COMPLETELY during warmup
             
             signal = self.generate_signal_v23(
                 spot, futures, vwap, vwap_distance, pcr, atr,
