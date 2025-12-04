@@ -879,6 +879,16 @@ class NiftyStrikeMaster:
             atm_data = strike_data[atm_strike]
             atm_ce_15m, atm_pe_15m, has_15m_atm = self.redis.get_strike_oi_change(atm_strike, atm_data, 15)
             atm_ce_5m, atm_pe_5m, has_5m_atm = self.redis.get_strike_oi_change(atm_strike, atm_data, 5)
+            
+            # Display with proper formatting
+            ce_15m_display = f"{atm_ce_15m:+.1f}%" if has_15m_atm else "N/A"
+            pe_15m_display = f"{atm_pe_15m:+.1f}%" if has_15m_atm else "N/A"
+            ce_5m_display = f"{atm_ce_5m:+.1f}%" if has_5m_atm else "N/A"
+            pe_5m_display = f"{atm_pe_5m:+.1f}%" if has_5m_atm else "N/A"
+            
+            logger.info(f"⚔️ ATM {atm_strike}: 15m CE={ce_15m_display} PE={pe_15m_display} | 5m CE={ce_5m_display} PE={pe_5m_display}")
+        else:
+            logger.info(f"⚠️ ATM strike {atm_strike} data not available")
         
         # Check multi-TF
         multi_tf = self.analyzer.check_multi_tf_confirmation(
@@ -891,12 +901,566 @@ class NiftyStrikeMaster:
             self.redis.save_strike_snapshot(strike, data)
         self.redis.save_total_oi_snapshot(total_ce, total_pe)
         
+        # Check warmup status
+        mem_stats = self.redis.get_memory_stats()
+        if not mem_stats['warmed_up_15m']:
+            logger.warning(f"⏳ Warmup: {mem_stats['elapsed_minutes']:.1f}/15 min | Snapshots: {mem_stats['snapshot_count']}")
+        
         # Log current status
         logger.info(f"💰 Spot: {spot:.2f} | Futures: {futures:.2f}")
         logger.info(f"📊 VWAP: {vwap:.2f} | PCR: {pcr:.2f} | Candle: {candle_color}")
-        logger.info(f"📉 Total OI 15m: CE={ce_total_15m:+.1f}% | PE={pe_total_15m:+.1f}%")
+        logger.info(f"📉 Total OI 15m: CE={ce_total_15m:+.1f}% | PE={pe_total_15m:+.1f}% {'(N/A)' if not has_15m_total else ''}")
+        logger.info(f"📉 Total OI 5m: CE={ce_total_5m:+.1f}% | PE={pe_total_5m:+.1f}% {'(N/A)' if not has_5m_total else ''}")
+        
+        # Check momentum
+        bullish_momentum = self.analyzer.check_momentum(df, 'bullish')
+        bearish_momentum = self.analyzer.check_momentum(df, 'bearish')
+        
+        # Create complete analysis data
+        analysis = AnalysisData(
+            spot_price=spot,
+            futures_price=futures,
+            atm_strike=atm_strike,
+            vwap=vwap,
+            atr=atr,
+            pcr=pcr,
+            total_ce_oi=total_ce,
+            total_pe_oi=total_pe,
+            atm_ce_oi=atm_data.get('ce_oi', 0),
+            atm_pe_oi=atm_data.get('pe_oi', 0),
+            atm_ce_vol=atm_data.get('ce_vol', 0),
+            atm_pe_vol=atm_data.get('pe_vol', 0),
+            ce_oi_15m=ce_total_15m,
+            pe_oi_15m=pe_total_15m,
+            ce_oi_5m=ce_total_5m,
+            pe_oi_5m=pe_total_5m,
+            atm_ce_change_15m=atm_ce_15m,
+            atm_pe_change_15m=atm_pe_15m,
+            atm_ce_change_5m=atm_ce_5m,
+            atm_pe_change_5m=atm_pe_5m,
+            candle_color=candle_color,
+            candle_size=candle_size,
+            open_price=candle_data['open'],
+            high_price=candle_data['high'],
+            low_price=candle_data['low'],
+            close_price=candle_data['close'],
+            current_volume=candle_data['volume'],
+            vwap_distance=vwap_distance,
+            volume_surge=vol_mult,
+            has_volume_spike=has_vol_spike,
+            order_flow_imbalance=order_flow,
+            max_pain_strike=max_pain_strike,
+            max_pain_distance=max_pain_dist,
+            gamma_zone=gamma_zone,
+            multi_tf_confirm=multi_tf,
+            bullish_momentum=bullish_momentum,
+            bearish_momentum=bearish_momentum,
+            strike_data_summary=strike_data,
+            data_quality={
+                'has_15m_total_oi': has_15m_total,
+                'has_5m_total_oi': has_5m_total,
+                'has_15m_atm_oi': has_15m_atm,
+                'has_5m_atm_oi': has_5m_atm,
+                'warmed_up': mem_stats['warmed_up_15m']
+            },
+            warnings=[]
+        )
+        
+        # Add warnings
+        if not has_15m_total:
+            analysis.warnings.append("15m total OI data not available")
+        if not has_15m_atm:
+            analysis.warnings.append("15m ATM OI data not available")
+        
+        # Send hourly update
+        await self.send_hourly_update(
+            spot, futures, atm_strike, vwap, atr, pcr,
+            total_ce, total_pe, ce_total_15m, pe_total_15m,
+            atm_data.get('ce_oi', 0), atm_data.get('pe_oi', 0),
+            atm_ce_15m, atm_pe_15m,
+            candle_data, vol
+        )
+        
+        # Generate signal with complete analysis
+        signal = self.generate_signal(
+            spot, futures, vwap, vwap_distance, pcr, atr,
+            ce_total_15m, pe_total_15m, ce_total_5m, pe_total_5m,
+            atm_ce_15m, atm_pe_15m, candle_color, candle_size,
+            has_vol_spike, vol_mult, df, order_flow, max_pain_dist, 
+            gamma_zone, multi_tf, atm_strike, strike_data,
+            has_15m_total, has_15m_atm, has_5m_total, has_5m_atm,
+            analysis
+        )
+        
+        if signal:
+            if self._can_send_signal(signal.strike):
+                await self.send_alert(signal)
+            else:
+                logger.info(f"✋ Duplicate signal blocked for strike {signal.strike}")
+        else:
+            logger.info("✋ No setup found")
         
         logger.info(f"{'='*80}\n")
+    
+    def generate_signal(self, spot_price, futures_price, vwap, vwap_distance, pcr, atr,
+                       ce_total_15m, pe_total_15m, ce_total_5m, pe_total_5m,
+                       atm_ce_change, atm_pe_change, candle_color, candle_size,
+                       has_vol_spike, vol_mult, df, order_flow, max_pain_dist,
+                       gamma_zone, multi_tf, atm_strike, strike_data,
+                       has_15m_total, has_15m_atm, has_5m_total, has_5m_atm,
+                       analysis: AnalysisData) -> Optional[Signal]:
+        """Enhanced signal generation with data quality checks"""
+        
+        stop_loss_points = int(atr * ATR_SL_MULTIPLIER)
+        target_points = int(atr * ATR_TARGET_MULTIPLIER)
+        
+        # Adjust targets based on OI strength
+        if abs(ce_total_15m) >= OI_THRESHOLD_STRONG or abs(atm_ce_change) >= OI_THRESHOLD_STRONG:
+            target_points = max(target_points, 80)
+        elif abs(ce_total_15m) >= OI_THRESHOLD_MEDIUM or abs(atm_ce_change) >= OI_THRESHOLD_MEDIUM:
+            target_points = max(target_points, 50)
+        
+        lot_size = NIFTY_CONFIG['lot_size']
+        quantity = 1
+        
+        atm_data = strike_data.get(atm_strike, {})
+        atm_ce_oi = atm_data.get('ce_oi', 0)
+        atm_pe_oi = atm_data.get('pe_oi', 0)
+        atm_ce_vol = atm_data.get('ce_vol', 0)
+        atm_pe_vol = atm_data.get('pe_vol', 0)
+        
+        # CE BUY SIGNAL
+        if (ce_total_15m < -OI_THRESHOLD_MEDIUM and has_15m_total) or \
+           (atm_ce_change < -ATM_OI_THRESHOLD and has_15m_atm):
+            
+            checks = {
+                "CE OI Unwinding (15m)": ce_total_15m < -OI_THRESHOLD_MEDIUM and has_15m_total,
+                "ATM CE Unwinding (15m)": atm_ce_change < -ATM_OI_THRESHOLD and has_15m_atm,
+                "Price > VWAP": futures_price > vwap,
+                "GREEN Candle": candle_color == 'GREEN'
+            }
+            
+            bonus = {
+                "Strong 5m CE Unwinding": ce_total_5m < -5.0 and has_5m_total,
+                "Big Candle": candle_size >= MIN_CANDLE_SIZE,
+                "Far from VWAP": vwap_distance >= VWAP_BUFFER,
+                "Bullish PCR": pcr > PCR_BULLISH,
+                "Volume Spike": has_vol_spike,
+                "Bullish Momentum": self.analyzer.check_momentum(df, 'bullish'),
+                "Order Flow Bullish": order_flow < 1.0,
+                "Multi-TF Confirmed": multi_tf,
+                "Gamma Zone": gamma_zone,
+                "ATM Strong Unwinding": atm_ce_change < -8.0 and has_15m_atm
+            }
+            
+            passed = sum(checks.values())
+            bonus_passed = sum(bonus.values())
+            
+            # Require at least 3 main checks AND good data quality
+            if passed >= 3 and (has_15m_total or has_15m_atm):
+                confidence = 70 + (passed * 5) + (bonus_passed * 3)
+                confidence = min(confidence, 98)
+                
+                if confidence >= 90:
+                    quantity = 2
+                
+                logger.info(f"🎯 CE BUY SIGNAL! Confidence: {confidence}%")
+                logger.info(f"   Checks passed: {passed}/4 | Bonus: {bonus_passed}/10")
+                
+                return Signal(
+                    type="CE_BUY",
+                    reason=f"Call Unwinding (Total: {ce_total_15m:.1f}%, ATM: {atm_ce_change:.1f}%)",
+                    confidence=confidence,
+                    spot_price=spot_price,
+                    futures_price=futures_price,
+                    strike=atm_strike,
+                    target_points=target_points,
+                    stop_loss_points=stop_loss_points,
+                    pcr=pcr,
+                    candle_color=candle_color,
+                    volume_surge=vol_mult,
+                    oi_5m=ce_total_5m,
+                    oi_15m=ce_total_15m,
+                    atm_ce_change=atm_ce_change,
+                    atm_pe_change=atm_pe_change,
+                    atr=atr,
+                    timestamp=datetime.now(IST),
+                    order_flow_imbalance=order_flow,
+                    max_pain_distance=max_pain_dist,
+                    gamma_zone=gamma_zone,
+                    multi_tf_confirm=multi_tf,
+                    lot_size=lot_size,
+                    quantity=quantity,
+                    atm_ce_oi=atm_ce_oi,
+                    atm_pe_oi=atm_pe_oi,
+                    atm_ce_vol=atm_ce_vol,
+                    atm_pe_vol=atm_pe_vol,
+                    analysis=analysis
+                )
+        
+        # PE BUY SIGNAL
+        if (pe_total_15m < -OI_THRESHOLD_MEDIUM and has_15m_total) or \
+           (atm_pe_change < -ATM_OI_THRESHOLD and has_15m_atm):
+            
+            if abs(pe_total_15m) >= OI_THRESHOLD_STRONG or abs(atm_pe_change) >= OI_THRESHOLD_STRONG:
+                target_points = max(target_points, 80)
+            
+            checks = {
+                "PE OI Unwinding (15m)": pe_total_15m < -OI_THRESHOLD_MEDIUM and has_15m_total,
+                "ATM PE Unwinding (15m)": atm_pe_change < -ATM_OI_THRESHOLD and has_15m_atm,
+                "Price < VWAP": futures_price < vwap,
+                "RED Candle": candle_color == 'RED'
+            }
+            
+            bonus = {
+                "Strong 5m PE Unwinding": pe_total_5m < -5.0 and has_5m_total,
+                "Big Candle": candle_size >= MIN_CANDLE_SIZE,
+                "Far from VWAP": vwap_distance >= VWAP_BUFFER,
+                "Bearish PCR": pcr < PCR_BEARISH,
+                "Volume Spike": has_vol_spike,
+                "Bearish Momentum": self.analyzer.check_momentum(df, 'bearish'),
+                "Order Flow Bearish": order_flow > 1.5,
+                "Multi-TF Confirmed": multi_tf,
+                "Gamma Zone": gamma_zone
+            }
+            
+            passed = sum(checks.values())
+            bonus_passed = sum(bonus.values())
+            
+            if passed >= 3 and (has_15m_total or has_15m_atm):
+                confidence = 70 + (passed * 5) + (bonus_passed * 3)
+                confidence = min(confidence, 98)
+                
+                if confidence >= 90:
+                    quantity = 2
+                
+                logger.info(f"🎯 PE BUY SIGNAL! Confidence: {confidence}%")
+                logger.info(f"   Checks passed: {passed}/4 | Bonus: {bonus_passed}/9")
+                
+                return Signal(
+                    type="PE_BUY",
+                    reason=f"Put Unwinding (Total: {pe_total_15m:.1f}%, ATM: {atm_pe_change:.1f}%)",
+                    confidence=confidence,
+                    spot_price=spot_price,
+                    futures_price=futures_price,
+                    strike=atm_strike,
+                    target_points=target_points,
+                    stop_loss_points=stop_loss_points,
+                    pcr=pcr,
+                    candle_color=candle_color,
+                    volume_surge=vol_mult,
+                    oi_5m=pe_total_5m,
+                    oi_15m=pe_total_15m,
+                    atm_ce_change=atm_ce_change,
+                    atm_pe_change=atm_pe_change,
+                    atr=atr,
+                    timestamp=datetime.now(IST),
+                    order_flow_imbalance=order_flow,
+                    max_pain_distance=max_pain_dist,
+                    gamma_zone=gamma_zone,
+                    multi_tf_confirm=multi_tf,
+                    lot_size=lot_size,
+                    quantity=quantity,
+                    atm_ce_oi=atm_ce_oi,
+                    atm_pe_oi=atm_pe_oi,
+                    atm_ce_vol=atm_ce_vol,
+                    atm_pe_vol=atm_pe_vol,
+                    analysis=analysis
+                )
+        
+        return None
+    
+    async def send_hourly_update(self, spot, futures, atm_strike, vwap, atr, pcr,
+                                 total_ce, total_pe, ce_15m, pe_15m, 
+                                 atm_ce_oi, atm_pe_oi, atm_ce_15m, atm_pe_15m,
+                                 candle_data, volume):
+        """Send hourly market data update to Telegram"""
+        if not HOURLY_UPDATE_ENABLED:
+            return
+        
+        if not self.hourly_collector.should_send_hourly_update():
+            return
+        
+        # Collect snapshot
+        snapshot = self.hourly_collector.collect_hourly_snapshot(
+            spot, futures, atm_strike, vwap, atr, pcr,
+            total_ce, total_pe, ce_15m, pe_15m,
+            atm_ce_oi, atm_pe_oi, atm_ce_15m, atm_pe_15m,
+            candle_data, volume
+        )
+        
+        # Generate message
+        message = self.hourly_collector.generate_hourly_json_message(snapshot)
+        
+        # Send to Telegram
+        if self.telegram:
+            try:
+                await asyncio.wait_for(
+                    self.telegram.send_message(chat_id=TELEGRAM_CHAT_ID, text=message),
+                    timeout=TELEGRAM_TIMEOUT
+                )
+                logger.info(f"✅ Hourly update sent: {snapshot['hour']}")
+                self.hourly_collector.last_hourly_update = datetime.now(IST)
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Hourly update timed out")
+            except Exception as e:
+                logger.error(f"❌ Hourly update error: {e}")
+    
+    async def send_alert(self, s: Signal):
+        """Send enhanced alert with complete analysis data"""
+        if s.type == "CE_BUY":
+            entry = s.spot_price
+            target = entry + s.target_points
+            stop_loss = entry - s.stop_loss_points
+            emoji = "🟢"
+            target_direction = "+"
+            sl_direction = "-"
+        else:
+            entry = s.spot_price
+            target = entry - s.target_points
+            stop_loss = entry + s.stop_loss_points
+            emoji = "🔴"
+            target_direction = "-"
+            sl_direction = "+"
+        
+        mode = "🧪 ALERT ONLY" if ALERT_ONLY_MODE else "⚡ LIVE"
+        timestamp_str = s.timestamp.strftime('%d-%b %I:%M %p')
+        risk = abs(entry - stop_loss)
+        reward = abs(target - entry)
+        rr_ratio = reward / risk if risk > 0 else 0
+        
+        # Build main signal message
+        msg = f"""
+{emoji} NIFTY50 STRIKE MASTER PRO v2.2
+
+{mode}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+⚡ SIGNAL: {s.type}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+📍 Entry: {entry:.1f}
+🎯 Target: {target:.1f} ({target_direction}{s.target_points:.0f} pts)
+🛑 Stop Loss: {stop_loss:.1f} ({sl_direction}{s.stop_loss_points:.0f} pts)
+📊 Strike: {s.strike}
+📦 Quantity: {s.quantity} lots ({s.quantity * s.lot_size} units)
+💎 Risk:Reward = 1:{rr_ratio:.1f}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+📊 LOGIC & CONFIDENCE
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+{s.reason}
+Confidence: {s.confidence}%
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+💰 MARKET DATA
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+Spot: {s.spot_price:.1f}
+Futures: {s.futures_price:.1f}
+PCR: {s.pcr:.2f}
+Candle: {s.candle_color}
+Volume: {s.volume_surge:.1f}x
+ATR: {s.atr:.1f}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+📉 OI ANALYSIS (Multi-TF)
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+Total OI Change:
+  5m:  CE={s.oi_5m:+.1f}% | PE={-s.oi_5m:+.1f}%
+  15m: CE={s.oi_15m:+.1f}% | PE={-s.oi_15m:+.1f}%
+
+ATM Strike {s.strike}:
+  CE: {s.atm_ce_change:+.1f}% {"(N/A)" if s.atm_ce_change == 0 else ""}
+  PE: {s.atm_pe_change:+.1f}% {"(N/A)" if s.atm_pe_change == 0 else ""}
+
+ATM OI Levels:
+  CE OI: {s.atm_ce_oi:,} | Vol: {s.atm_ce_vol:,}
+  PE OI: {s.atm_pe_oi:,} | Vol: {s.atm_pe_vol:,}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+🔥 ADVANCED METRICS
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+Order Flow: {s.order_flow_imbalance:.2f}
+{"  (CE Buying)" if s.order_flow_imbalance < 1.0 else "  (PE Buying)"}
+
+Max Pain: {s.max_pain_distance:.0f} pts away
+
+{"⚡ Gamma Zone: ACTIVE" if s.gamma_zone else ""}
+{"✅ Multi-TF: CONFIRMED" if s.multi_tf_confirm else ""}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+⏰ {timestamp_str}
+
+✅ v2.2 - Weekly Expiry Fix
+"""
+        
+        logger.info(f"🚨 {s.type} @ {entry:.1f} → Target: {target:.1f} | SL: {stop_loss:.1f}")
+        
+        # Send main signal
+        if self.telegram:
+            try:
+                await asyncio.wait_for(
+                    self.telegram.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg),
+                    timeout=TELEGRAM_TIMEOUT
+                )
+                logger.info("✅ Alert sent to Telegram")
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Telegram alert timed out")
+            except Exception as e:
+                logger.error(f"❌ Telegram error: {e}")
+        
+        # Send detailed analysis if enabled
+        if SEND_ANALYSIS_DATA and s.analysis and self.telegram:
+            await self.send_analysis_data(s.analysis, s.type)
+    
+    async def send_analysis_data(self, analysis: AnalysisData, signal_type: str):
+        """Send complete analysis data for transparency"""
+        timestamp_str = analysis.timestamp.strftime('%d-%b %I:%M %p')
+        
+        # Format strike data
+        strike_summary = []
+        for strike, data in sorted(analysis.strike_data_summary.items()):
+            ce_oi = data['ce_oi']
+            pe_oi = data['pe_oi']
+            ce_vol = data['ce_vol']
+            pe_vol = data['pe_vol']
+            mark = "🎯" if strike == analysis.atm_strike else "  "
+            strike_summary.append(f"{mark}{strike}: CE OI={ce_oi:,} Vol={ce_vol:,} | PE OI={pe_oi:,} Vol={pe_vol:,}")
+        
+        strikes_text = "\n".join(strike_summary[:5])  # Top 5 strikes
+        
+        # Data quality status
+        quality_items = []
+        for key, value in analysis.data_quality.items():
+            status = "✅" if value else "❌"
+            quality_items.append(f"{status} {key.replace('_', ' ').title()}")
+        quality_text = "\n".join(quality_items)
+        
+        # Warnings
+        warnings_text = "\n".join([f"⚠️ {w}" for w in analysis.warnings]) if analysis.warnings else "✅ No warnings"
+        
+        analysis_msg = f"""
+📊 COMPLETE ANALYSIS DATA
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+🕐 Time: {timestamp_str}
+📍 Signal: {signal_type}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+💰 PRICE DATA
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+Spot: {analysis.spot_price:.2f}
+Futures: {analysis.futures_price:.2f}
+VWAP: {analysis.vwap:.2f}
+Distance from VWAP: {analysis.vwap_distance:.2f}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+🕯️ CANDLE DATA
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+Color: {analysis.candle_color}
+Size: {analysis.candle_size:.2f}
+Open: {analysis.open_price:.2f}
+High: {analysis.high_price:.2f}
+Low: {analysis.low_price:.2f}
+Close: {analysis.close_price:.2f}
+Volume: {analysis.current_volume:,}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+📈 TECHNICAL INDICATORS
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+ATR: {analysis.atr:.2f}
+PCR: {analysis.pcr:.2f}
+Order Flow: {analysis.order_flow_imbalance:.2f}
+Volume Surge: {analysis.volume_surge:.1f}x
+Has Spike: {"Yes" if analysis.has_volume_spike else "No"}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+📊 OI DATA (Total)
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+Total CE OI: {analysis.total_ce_oi:,}
+Total PE OI: {analysis.total_pe_oi:,}
+
+15m Changes:
+  CE: {analysis.ce_oi_15m:+.1f}%
+  PE: {analysis.pe_oi_15m:+.1f}%
+
+5m Changes:
+  CE: {analysis.ce_oi_5m:+.1f}%
+  PE: {analysis.pe_oi_5m:+.1f}%
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 ATM STRIKE {analysis.atm_strike}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+CE OI: {analysis.atm_ce_oi:,}
+PE OI: {analysis.atm_pe_oi:,}
+CE Vol: {analysis.atm_ce_vol:,}
+PE Vol: {analysis.atm_pe_vol:,}
+
+15m Changes:
+  CE: {analysis.atm_ce_change_15m:+.1f}%
+  PE: {analysis.atm_pe_change_15m:+.1f}%
+
+5m Changes:
+  CE: {analysis.atm_ce_change_5m:+.1f}%
+  PE: {analysis.atm_pe_change_5m:+.1f}%
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+🎲 ADVANCED ANALYSIS
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+Max Pain: {analysis.max_pain_strike}
+Distance: {analysis.max_pain_distance:.0f} pts
+
+Gamma Zone: {"Yes ⚡" if analysis.gamma_zone else "No"}
+Multi-TF: {"Confirmed ✅" if analysis.multi_tf_confirm else "Not Confirmed"}
+Bullish Momentum: {"Yes" if analysis.bullish_momentum else "No"}
+Bearish Momentum: {"Yes" if analysis.bearish_momentum else "No"}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+📋 STRIKE DATA
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+{strikes_text}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+✅ DATA QUALITY
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+{quality_text}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ WARNINGS
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+{warnings_text}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 Use this data to verify the signal
+and make informed trading decisions!
+"""
+        
+        if self.telegram:
+            try:
+                await asyncio.wait_for(
+                    self.telegram.send_message(chat_id=TELEGRAM_CHAT_ID, text=analysis_msg),
+                    timeout=TELEGRAM_TIMEOUT
+                )
+                logger.info("✅ Analysis data sent to Telegram")
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Analysis data timed out")
+            except Exception as e:
+                logger.error(f"❌ Analysis send error: {e}")
     
     async def send_startup_message(self):
         """Send startup notification"""
