@@ -229,10 +229,11 @@ class HourlyDataCollector:
         return elapsed >= HOURLY_UPDATE_INTERVAL
     
     def collect_hourly_snapshot(self, spot, futures, atm_strike, vwap, atr, pcr,
-                                total_ce, total_pe, ce_15m, pe_15m, atm_ce_oi, atm_pe_oi,
-                                atm_ce_15m, atm_pe_15m, candle_data, volume, 
+                                total_ce, total_pe, ce_15m, pe_15m, ce_5m, pe_5m,
+                                atm_ce_oi, atm_pe_oi, atm_ce_15m, atm_pe_15m, 
+                                atm_ce_5m, atm_pe_5m, candle_data, volume, 
                                 order_flow, max_pain, gamma_zone, india_vix=0) -> dict:
-        """v2.3: Enhanced snapshot with sentiment"""
+        """v2.3 FIXED: Enhanced snapshot with 5m + 15m data"""
         now = datetime.now(IST)
         
         snapshot = {
@@ -261,6 +262,8 @@ class HourlyDataCollector:
                 "total_ce_oi": total_ce,
                 "total_pe_oi": total_pe,
                 "pcr": round(pcr, 2),
+                "ce_change_5m": round(ce_5m, 2),
+                "pe_change_5m": round(pe_5m, 2),
                 "ce_change_15m": round(ce_15m, 2),
                 "pe_change_15m": round(pe_15m, 2),
                 "order_flow": round(order_flow, 2)
@@ -270,6 +273,8 @@ class HourlyDataCollector:
                 "strike": atm_strike,
                 "ce_oi": atm_ce_oi,
                 "pe_oi": atm_pe_oi,
+                "ce_change_5m": round(atm_ce_5m, 2),
+                "pe_change_5m": round(atm_pe_5m, 2),
                 "ce_change_15m": round(atm_ce_15m, 2),
                 "pe_change_15m": round(atm_pe_15m, 2),
                 "ce_pe_ratio": round(atm_ce_oi / atm_pe_oi, 2) if atm_pe_oi > 0 else 0
@@ -319,7 +324,7 @@ class HourlyDataCollector:
             return "NEUTRAL"
     
     def generate_hourly_json_message(self, snapshot: dict) -> str:
-        """v2.3: Enhanced Telegram message"""
+        """v2.3 FIXED: Enhanced message with 5m + 15m data"""
         json_str = json.dumps(snapshot, indent=2)
         sentiment = snapshot['market_sentiment']
         sentiment_emoji = "🟢" if sentiment == "BULLISH" else "🔴" if sentiment == "BEARISH" else "⚪"
@@ -343,15 +348,15 @@ Range: {snapshot['candle']['range']:.2f} pts
 H: {snapshot['candle']['high']:.2f} | L: {snapshot['candle']['low']:.2f}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-📊 OPEN INTEREST
+📊 OPEN INTEREST (Multi-TF)
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
 PCR: {snapshot['oi_data']['pcr']}
 Order Flow: {snapshot['oi_data']['order_flow']}
 
-Total OI Changes (15m):
-  CE: {snapshot['oi_data']['ce_change_15m']:+.1f}%
-  PE: {snapshot['oi_data']['pe_change_15m']:+.1f}%
+Total OI Changes:
+  5m:  CE={snapshot['oi_data']['ce_change_5m']:+.1f}% | PE={snapshot['oi_data']['pe_change_5m']:+.1f}%
+  15m: CE={snapshot['oi_data']['ce_change_15m']:+.1f}% | PE={snapshot['oi_data']['pe_change_15m']:+.1f}%
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 🎯 ATM STRIKE: {snapshot['atm_data']['strike']}
@@ -361,9 +366,9 @@ CE OI: {snapshot['atm_data']['ce_oi']:,}
 PE OI: {snapshot['atm_data']['pe_oi']:,}
 Ratio: {snapshot['atm_data']['ce_pe_ratio']}
 
-ATM Changes (15m):
-  CE: {snapshot['atm_data']['ce_change_15m']:+.1f}%
-  PE: {snapshot['atm_data']['pe_change_15m']:+.1f}%
+ATM Changes:
+  5m:  CE={snapshot['atm_data']['ce_change_5m']:+.1f}% | PE={snapshot['atm_data']['pe_change_5m']:+.1f}%
+  15m: CE={snapshot['atm_data']['ce_change_15m']:+.1f}% | PE={snapshot['atm_data']['pe_change_15m']:+.1f}%
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 📈 TECHNICAL
@@ -381,7 +386,7 @@ Gamma Zone: {"YES ⚡" if snapshot['technical']['gamma_zone'] else "NO"}
 {json_str}
 ```
 
-💾 Data saved for backtesting
+💾 Data saved for backtesting & analysis
 """
         return message
 
@@ -1010,12 +1015,62 @@ class NiftyStrikeMaster:
             self.redis.save_strike_snapshot(strike, data)
         self.redis.save_total_oi_snapshot(total_ce, total_pe)
         
-        # Log current status
+        # Log current status with DETAILED OI DATA
         logger.info(f"💰 Spot: {spot:.2f} | Futures: {futures:.2f}")
-        logger.info(f"📊 VWAP: {vwap:.2f} | PCR: {pcr:.2f} | Candle: {candle_color}")
-        logger.info(f"📉 Total OI 15m: CE={ce_total_15m:+.1f}% | PE={pe_total_15m:+.1f}%")
+        logger.info(f"📊 VWAP: {vwap:.2f} | Distance: {vwap_distance:.2f} | PCR: {pcr:.2f}")
+        logger.info(f"🕯️ Candle: {candle_color} | Size: {candle_size:.1f} | ATR: {atr:.1f}")
+        
+        # DETAILED OI LOGGING
+        logger.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        logger.info(f"📊 TOTAL OI ANALYSIS")
+        logger.info(f"   CE: {total_ce:,} | PE: {total_pe:,}")
+        
+        if has_5m_total:
+            logger.info(f"   5m:  CE={ce_total_5m:+.2f}% | PE={pe_total_5m:+.2f}%")
+        else:
+            logger.info(f"   5m:  ⏳ Data not available yet")
+        
+        if has_15m_total:
+            logger.info(f"   15m: CE={ce_total_15m:+.2f}% | PE={pe_total_15m:+.2f}%")
+        else:
+            logger.info(f"   15m: ⏳ Data not available yet")
+        
+        # ATM OI LOGGING
+        logger.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        logger.info(f"🎯 ATM STRIKE {atm_strike} ANALYSIS")
+        if atm_data:
+            logger.info(f"   CE OI: {atm_data.get('ce_oi', 0):,} | PE OI: {atm_data.get('pe_oi', 0):,}")
+            logger.info(f"   CE Vol: {atm_data.get('ce_vol', 0):,} | PE Vol: {atm_data.get('pe_vol', 0):,}")
+            
+            if has_5m_atm:
+                logger.info(f"   5m:  CE={atm_ce_5m:+.2f}% | PE={atm_pe_5m:+.2f}%")
+            else:
+                logger.info(f"   5m:  ⏳ Data not available yet")
+            
+            if has_15m_atm:
+                logger.info(f"   15m: CE={atm_ce_15m:+.2f}% | PE={atm_pe_15m:+.2f}%")
+            else:
+                logger.info(f"   15m: ⏳ Data not available yet")
+        else:
+            logger.info(f"   ⚠️ ATM strike data not found")
+        
+        logger.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        logger.info(f"📈 ADVANCED METRICS")
+        logger.info(f"   Order Flow: {order_flow:.2f} | Max Pain: {max_pain_strike}")
+        logger.info(f"   Volume Surge: {vol_mult:.1f}x | Gamma Zone: {'YES' if gamma_zone else 'NO'}")
+        
         if expiry_today:
-            logger.info("⚡ EXPIRY DAY - Using wider SL")
+            logger.info(f"   ⚡ EXPIRY DAY - Using wider SL ({ATR_SL_GAMMA_MULTIPLIER}x)")
+        
+        # Memory stats
+        mem_stats = self.redis.get_memory_stats()
+        logger.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        logger.info(f"💾 MEMORY STATUS")
+        logger.info(f"   Snapshots: {mem_stats['snapshot_count']}")
+        logger.info(f"   Elapsed: {mem_stats['elapsed_minutes']:.1f} min")
+        logger.info(f"   5m Ready: {'✅' if mem_stats['warmed_up_5m'] else '⏳ (need 5 min)'}")
+        logger.info(f"   15m Ready: {'✅' if mem_stats['warmed_up_10m'] else '⏳ (need 10 min)'}")
+        logger.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         
         # Check momentum
         bullish_momentum = self.analyzer.check_momentum(df, 'bullish')
@@ -1080,14 +1135,25 @@ class NiftyStrikeMaster:
         # Send hourly update
         await self.send_hourly_update(
             spot, futures, atm_strike, vwap, atr, pcr,
-            total_ce, total_pe, ce_total_15m, pe_total_15m,
+            total_ce, total_pe, ce_total_15m, pe_total_15m, ce_total_5m, pe_total_5m,
             atm_data.get('ce_oi', 0), atm_data.get('pe_oi', 0),
-            atm_ce_15m, atm_pe_15m,
+            atm_ce_15m, atm_pe_15m, atm_ce_5m, atm_pe_5m,
             candle_data, vol, order_flow, max_pain_strike, gamma_zone
         )
         
         # Generate signal (only after 9:25)
         if should_generate_signals():
+            # Check if warmed up
+            mem_stats = self.redis.get_memory_stats()
+            
+            if not mem_stats['warmed_up_10m']:
+                logger.info(f"⏳ WARMUP IN PROGRESS")
+                logger.info(f"   Need 10 min for reliable signals")
+                logger.info(f"   Elapsed: {mem_stats['elapsed_minutes']:.1f} min")
+                logger.info(f"   5m data: {'✅ Ready' if mem_stats['warmed_up_5m'] else '⏳ Not yet'}")
+                logger.info(f"   15m data: {'✅ Ready' if mem_stats['warmed_up_10m'] else '⏳ Not yet'}")
+                # Still generate signal if data available, but log warmup status
+            
             signal = self.generate_signal_v23(
                 spot, futures, vwap, vwap_distance, pcr, atr,
                 ce_total_15m, pe_total_15m, ce_total_5m, pe_total_5m,
@@ -1346,10 +1412,11 @@ class NiftyStrikeMaster:
         return None
     
     async def send_hourly_update(self, spot, futures, atm_strike, vwap, atr, pcr,
-                                 total_ce, total_pe, ce_15m, pe_15m, 
+                                 total_ce, total_pe, ce_15m, pe_15m, ce_5m, pe_5m,
                                  atm_ce_oi, atm_pe_oi, atm_ce_15m, atm_pe_15m,
+                                 atm_ce_5m, atm_pe_5m,
                                  candle_data, volume, order_flow, max_pain, gamma_zone):
-        """v2.3: Enhanced hourly update"""
+        """v2.3 FIXED: Enhanced hourly update with 5m data"""
         if not HOURLY_UPDATE_ENABLED:
             return
         
@@ -1358,8 +1425,9 @@ class NiftyStrikeMaster:
         
         snapshot = self.hourly_collector.collect_hourly_snapshot(
             spot, futures, atm_strike, vwap, atr, pcr,
-            total_ce, total_pe, ce_15m, pe_15m,
+            total_ce, total_pe, ce_15m, pe_15m, ce_5m, pe_5m,
             atm_ce_oi, atm_pe_oi, atm_ce_15m, atm_pe_15m,
+            atm_ce_5m, atm_pe_5m,
             candle_data, volume, order_flow, max_pain, gamma_zone
         )
         
